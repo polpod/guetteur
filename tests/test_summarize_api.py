@@ -44,7 +44,13 @@ def test_system_prompt_is_french_and_complete() -> None:
         "N'invente rien",
     ):
         assert expected in SYSTEM_PROMPT
-    assert set(SUMMARY_SCHEMA["required"]) == {"title", "tldr", "key_points", "why_it_matters"}
+    assert set(SUMMARY_SCHEMA["required"]) == {
+        "title",
+        "tldr",
+        "key_points",
+        "why_it_matters",
+        "announced_items",
+    }
 
 
 def test_summarize_sends_expected_request() -> None:
