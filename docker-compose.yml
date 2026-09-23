@@ -1,0 +1,19 @@
+services:
+  guetteur:
+    build:
+      context: .
+      args:
+        WITH_WHISPER: "0"   # "1" pour inclure faster-whisper (whisper_enabled = true)
+    image: guetteur:latest
+    container_name: guetteur
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+      - ./config.toml:/app/config.toml:ro
+    command: ["run"]
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns:yt="http://www.youtube.com/xml/schemas/2015" xmlns:media="http://search.yahoo.com/mrss/" xmlns="http://www.w3.org/2005/Atom">
+ <link rel="self" href="http://www.youtube.com/feeds/videos.xml?playlist_id=PLtest123"/>
+ <id>yt:playlist:PLtest123</id>
+ <yt:playlistId>PLtest123</yt:playlistId>
+ <yt:channelId>UCabc</yt:channelId>
+ <title>Veille IA</title>
+ <link rel="alternate" href="https://www.youtube.com/playlist?list=PLtest123"/>
+ <author>
+  <name>Ma Chaîne</name>
+  <uri>https://www.youtube.com/channel/UCabc</uri>
+ </author>
+ <published>2024-01-01T10:00:00+00:00</published>
+ <entry>
+  <id>yt:video:AAAAAAAAAA1</id>
+  <yt:videoId>AAAAAAAAAA1</yt:videoId>
+  <yt:channelId>UCabc</yt:channelId>
+  <title>Les LLM expliqués &amp; démystifiés</title>
+  <link rel="alternate" href="https://www.youtube.com/watch?v=AAAAAAAAAA1"/>
+  <author>
+   <name>Chaîne Alpha</name>
+   <uri>https://www.youtube.com/channel/UCalpha</uri>
+  </author>
+  <published>2024-03-01T12:00:00+00:00</published>
+  <updated>2024-03-02T08:00:00+00:00</updated>
+  <media:group>
+   <media:title>Les LLM expliqués &amp; démystifiés</media:title>
+   <media:content url="https://www.youtube.com/v/AAAAAAAAAA1?version=3" type="application/x-shockwave-flash" width="640" height="390"/>
+   <media:thumbnail url="https://i1.ytimg.com/vi/AAAAAAAAAA1/hqdefault.jpg" width="480" height="360"/>
+   <media:description>Description A</media:description>
+  </media:group>
+ </entry>
+ <entry>
+  <id>yt:video:BBBBBBBBBB2</id>
+  <yt:videoId>BBBBBBBBBB2</yt:videoId>
+  <yt:channelId>UCbeta</yt:channelId>
+  <title>Proxmox en 10 minutes</title>
+  <link rel="alternate" href="https://www.youtube.com/watch?v=BBBBBBBBBB2"/>
+  <author>
+   <name>Chaîne Beta</name>
+   <uri>https://www.youtube.com/channel/UCbeta</uri>
+  </author>
+  <published>2024-04-15T09:30:00+00:00</published>
+  <updated>2024-04-15T10:00:00+00:00</updated>
+  <media:group>
+   <media:title>Proxmox en 10 minutes</media:title>
+   <media:description>Description B</media:description>
+  </media:group>
+ </entry>
+ <entry>
+  <id>yt:video:CCCCCCCCCC3</id>
+  <yt:videoId>CCCCCCCCCC3</yt:videoId>
+  <yt:channelId>UCgamma</yt:channelId>
+  <title>Vieille vidéo</title>
+  <link rel="alternate" href="https://www.youtube.com/watch?v=CCCCCCCCCC3"/>
+  <author>
+   <name>Chaîne Gamma</name>
+   <uri>https://www.youtube.com/channel/UCgamma</uri>
+  </author>
+  <published>2023-11-20T18:00:00+00:00</published>
+  <updated>2023-11-21T18:00:00+00:00</updated>
+  <media:group>
+   <media:title>Vieille vidéo</media:title>
+   <media:description>Description C</media:description>
+  </media:group>
+ </entry>
+</feed>

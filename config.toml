@@ -1,0 +1,38 @@
+# Configuration GUETTEUR — les secrets vont dans .env, jamais ici.
+
+[general]
+poll_interval_seconds = 300        # intervalle de polling (secondes)
+claude_model = "claude-sonnet-4-6" # modèle Claude utilisé pour les résumés
+max_videos_per_cycle = 3           # vidéos traitées au maximum par cycle
+data_dir = "data"                  # base SQLite, token OAuth, client_secret.json
+log_level = "INFO"
+
+[transcript]
+languages = ["fr", "en"]    # ordre de préférence des sous-titres ; ensuite n'importe laquelle
+whisper_enabled = false     # secours yt-dlp + faster-whisper (image Docker : WITH_WHISPER=1)
+whisper_model = "small"
+max_retries = 3             # nouveaux essais (1 par cycle) avant abandon
+
+[summarize]
+# "claude_code" : binaire Claude Code déjà connecté (claude auth login), sans clé API.
+# "claude_api"  : SDK anthropic, nécessite ANTHROPIC_API_KEY dans .env.
+provider = "claude_code"
+claude_code_bin = "claude"  # nom dans le PATH ou chemin absolu
+timeout_s = 180             # délai maximal par appel (secondes)
+
+[whatsapp]
+api_version = "v20.0"
+# Modèle (template) envoyé si la fenêtre de 24 h est fermée. « hello_world » existe par défaut
+# mais ne contient pas de variable ; créez plutôt un modèle avec {{1}} (voir README).
+template_name = "hello_world"
+template_language = "en_US"
+template_body_param = false
+
+# Une section [[playlists]] par playlist surveillée.
+
+[[playlists]]
+id = "PLNH7S2yTLTqA"
+label = "Résumé"
+language = "fr"
+notify = "telegram"
+private = false

@@ -1,0 +1,32 @@
+# /etc/systemd/system/guetteur.service — installé par scripts/install-lxc.sh
+[Unit]
+Description=GUETTEUR - veille YouTube résumée par Claude
+Documentation=file:///opt/guetteur/README.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=guetteur
+Group=guetteur
+WorkingDirectory=/opt/guetteur
+EnvironmentFile=/opt/guetteur/.env
+# uv (/usr/local/bin) et claude (/usr/bin, installé par npm -g) doivent être dans le PATH.
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# Le binaire claude est installé en root : pas de mise à jour automatique par le service.
+Environment=DISABLE_AUTOUPDATER=1
+# --no-sync : l'environnement est préparé par install-lxc.sh (uv sync --frozen --no-dev).
+ExecStart=/usr/local/bin/uv run --no-sync guetteur run
+Restart=always
+RestartSec=10
+TimeoutStopSec=30
+
+# Durcissement léger : ~/.claude (session) et /opt/guetteur/data restent inscriptibles.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target
