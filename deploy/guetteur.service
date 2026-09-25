@@ -2,8 +2,10 @@
 [Unit]
 Description=GUETTEUR - veille YouTube résumée par Claude
 Documentation=file:///opt/guetteur/README.md
-Wants=network-online.target
+Wants=network-online.target guetteur-health.timer
 After=network-online.target
+# Pas de démarrage tant que .env n'est pas en place (install-lxc.sh laisse l'unité désactivée).
+ConditionPathExists=/opt/guetteur/.env
 
 [Service]
 Type=simple

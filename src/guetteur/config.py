@@ -47,6 +47,18 @@ class SummarizeConfig:
 
 
 @dataclass(frozen=True)
+class NotifyConfig:
+    # Canal tenté après un échec définitif sur le canal principal de la playlist.
+    fallback: NotifyChannel | None = None
+    # Tentatives par canal (erreurs passagères seulement : 5xx, 429, timeout).
+    max_attempts: int = 3
+    # Attente après la tentative n (la dernière valeur sert au-delà).
+    retry_delays_s: tuple[float, ...] = (2.0, 8.0, 30.0)
+    # Une vidéo en « sending » depuis plus longtemps est reprise au cycle suivant.
+    sending_timeout_min: int = 10
+
+
+@dataclass(frozen=True)
 class WhatsAppConfig:
     api_version: str = "v20.0"
     template_name: str = "hello_world"
@@ -86,6 +98,7 @@ class Config:
     log_level: str = "INFO"
     transcript: TranscriptConfig = field(default_factory=TranscriptConfig)
     summarize: SummarizeConfig = field(default_factory=SummarizeConfig)
+    notify: NotifyConfig = field(default_factory=NotifyConfig)
     whatsapp: WhatsAppConfig = field(default_factory=WhatsAppConfig)
     secrets: Secrets = field(default_factory=Secrets)
 
@@ -145,7 +158,32 @@ def _parse_summarize(raw: dict[str, Any]) -> SummarizeConfig:
     return SummarizeConfig(provider=provider, claude_code_bin=binary, timeout_s=float(timeout))
 
 
-_SECTIONS = frozenset({"general", "transcript", "summarize", "whatsapp", "playlists"})
+def _parse_notify(raw: dict[str, Any]) -> NotifyConfig:
+    fallback = raw.get("fallback")
+    if fallback in ("", "none", None):
+        fallback = None
+    elif fallback not in _CHANNELS:
+        raise ConfigError(
+            f"notify.fallback doit valoir 'telegram', 'whatsapp' ou \"\" (reçu : {fallback!r})"
+        )
+    delays = raw.get("retry_delays_s", [2, 8, 30])
+    if (
+        not isinstance(delays, list)
+        or not delays
+        or any(isinstance(d, bool) or not isinstance(d, int | float) or d < 0 for d in delays)
+    ):
+        raise ConfigError(f"notify.retry_delays_s doit être une liste de durées ≥ 0 : {delays!r}")
+    return NotifyConfig(
+        fallback=fallback,
+        max_attempts=_positive_int(raw.get("max_attempts", 3), "notify.max_attempts"),
+        retry_delays_s=tuple(float(d) for d in delays),
+        sending_timeout_min=_positive_int(
+            raw.get("sending_timeout_min", 10), "notify.sending_timeout_min"
+        ),
+    )
+
+
+_SECTIONS = frozenset({"general", "transcript", "summarize", "notify", "whatsapp", "playlists"})
 
 
 def parse_config(data: dict[str, Any], secrets: Secrets | None = None) -> Config:
@@ -180,6 +218,7 @@ def parse_config(data: dict[str, Any], secrets: Secrets | None = None) -> Config
             max_retries=_positive_int(tr.get("max_retries", 3), "max_retries"),
         ),
         summarize=_parse_summarize(data.get("summarize", {})),
+        notify=_parse_notify(data.get("notify", {})),
         whatsapp=WhatsAppConfig(
             api_version=str(wa.get("api_version", "v20.0")),
             template_name=str(wa.get("template_name", "hello_world")),

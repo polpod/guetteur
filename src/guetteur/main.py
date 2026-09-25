@@ -1,4 +1,5 @@
-"""Point d'entrée CLI : guetteur run | once | backfill | test-notify | doctor | auth."""
+"""Point d'entrée CLI : guetteur run | once | backfill | status | retry | reset | health |
+test-notify | doctor | auth."""
 
 from __future__ import annotations
 
@@ -21,7 +22,7 @@ from guetteur.models import KeyPoint, Summary, Video
 from guetteur.notify import NotifyError, build_notifier
 from guetteur.pipeline import Pipeline, build_message
 from guetteur.sources.base import SourceError, VideoSource
-from guetteur.store import Store
+from guetteur.store import Status, Store
 
 log = logging.getLogger("guetteur")
 
@@ -110,13 +111,107 @@ def cmd_run(config: Config) -> int:
     return 0
 
 
-def cmd_backfill(config: Config, playlist_id: str, limit: int) -> int:
+def cmd_backfill(config: Config, playlist_id: str, limit: int, force: bool) -> int:
     store = Store(config.db_path)
     try:
-        stats = build_pipeline(config, store).backfill(playlist_id, limit)
+        stats = build_pipeline(config, store).backfill(playlist_id, limit, force=force)
     finally:
         store.close()
     return 1 if stats.failed or stats.aborted else 0
+
+
+def cmd_status(config: Config, limit: int, status: str | None) -> int:
+    from guetteur.tables import render_rows, truncate
+
+    store = Store(config.db_path)
+    try:
+        records = store.list_videos(limit=limit, status=Status(status) if status else None)
+        counts = store.counts()
+        beat = store.heartbeat()
+    finally:
+        store.close()
+    labels = {p.id: p.label for p in config.playlists}
+    rows = [
+        [
+            r.video_id,
+            truncate(r.title, 40),
+            truncate(labels.get(r.playlist_id, r.playlist_id), 20),
+            r.status.value if r.status is not Status.SENT or r.sent_at else "sent (ignorée)",
+            str(r.retries),
+            truncate(r.last_error, 70),
+        ]
+        for r in records
+    ]
+    if rows:
+        print(
+            render_rows(["id", "titre", "playlist", "statut", "retries", "dernière erreur"], rows)
+        )
+    else:
+        print("Aucune vidéo.")
+    summary = ", ".join(f"{k}={v}" for k, v in sorted(counts.items())) or "base vide"
+    print(f"\nTotal : {summary}")
+    print(f"Dernier cycle : {beat.isoformat(timespec='seconds') if beat else 'jamais'}")
+    return 0
+
+
+def cmd_retry(config: Config, video_id: str | None) -> int:
+    store = Store(config.db_path)
+    try:
+        if video_id is not None:
+            record = store.get(video_id)
+            if record is None:
+                print(f"❌ Vidéo inconnue : {video_id}", file=sys.stderr)
+                return 1
+            if record.status is not Status.FAILED:
+                print(f"→ {video_id} n'est pas « failed » (statut : {record.status.value}).")
+                return 0
+        ids = store.retry_failed(video_id)
+    finally:
+        store.close()
+    for vid in ids:
+        log.info("video.retry_requested", extra={"video_id": vid})
+    print(f"✅ {len(ids)} vidéo(s) remise(s) en file : {', '.join(ids) or '—'}")
+    if ids:
+        print("   Elles partiront au prochain cycle (service) ou avec : guetteur once")
+    return 0
+
+
+def cmd_reset(config: Config, video_id: str) -> int:
+    store = Store(config.db_path)
+    try:
+        before = store.reset(video_id)
+    finally:
+        store.close()
+    if before is None:
+        print(f"❌ Vidéo inconnue : {video_id}", file=sys.stderr)
+        return 1
+    log.info("video.reset", extra={"video_id": video_id, "previous_status": before.status.value})
+    print(f"✅ {video_id} remise en « new » (était : {before.status.value}).")
+    print("   Transcription, résumé et envoi seront refaits au prochain cycle.")
+    if before.really_sent:
+        print("⚠️  Cette vidéo avait déjà été envoyée : elle le sera une seconde fois.")
+    return 0
+
+
+def cmd_health(config: Config, alert: bool) -> int:
+    from guetteur.health import check_health, maybe_alert
+    from guetteur.tables import render_rows
+
+    store = Store(config.db_path)
+    try:
+        checks = check_health(config, store)
+        print(
+            render_rows(
+                ["vérification", "état", "détail"],
+                [[c.name, "OK" if c.ok else "KO", c.detail] for c in checks],
+            )
+        )
+        if alert:
+            outcome = maybe_alert(store, checks, lambda: build_notifier("telegram", config))
+            print(f"Alerte : {outcome}")
+    finally:
+        store.close()
+    return 0 if all(c.ok for c in checks) else 1
 
 
 def _sample_message() -> tuple[Summary, Video]:
@@ -198,6 +293,22 @@ def build_parser() -> argparse.ArgumentParser:
     bf = sub.add_parser("backfill", help="traite les dernières vidéos d'une playlist")
     bf.add_argument("--playlist", required=True, help="identifiant de la playlist")
     bf.add_argument("--limit", type=int, default=5, help="nombre de vidéos (défaut 5)")
+    bf.add_argument(
+        "--force", action="store_true", help="reprend aussi les vidéos « failed » de la playlist"
+    )
+    st = sub.add_parser("status", help="tableau des vidéos et de leur état")
+    st.add_argument("--limit", type=int, default=30, help="nombre de lignes (défaut 30)")
+    st.add_argument("--status", choices=[s.value for s in Status], default=None)
+    rt = sub.add_parser("retry", help="remet en file les vidéos « failed »")
+    target = rt.add_mutually_exclusive_group(required=True)
+    target.add_argument("--video-id", help="une vidéo précise")
+    target.add_argument("--all", action="store_true", help="toutes les vidéos « failed »")
+    rs = sub.add_parser("reset", help="retraitement complet d'une vidéo (repasse en « new »)")
+    rs.add_argument("--video-id", required=True)
+    he = sub.add_parser("health", help="base OK et dernier cycle récent (code retour 1 si KO)")
+    he.add_argument(
+        "--alert", action="store_true", help="alerte Telegram si KO (au plus une par heure)"
+    )
     tn = sub.add_parser("test-notify", help="envoie un message de test")
     tn.add_argument("--channel", choices=["telegram", "whatsapp"], default=None)
     sub.add_parser("doctor", help="vérifie claude, ffmpeg, la base et les jetons")
@@ -224,7 +335,15 @@ def cli(argv: Sequence[str] | None = None) -> int:
             case "once":
                 return cmd_once(config)
             case "backfill":
-                return cmd_backfill(config, args.playlist, args.limit)
+                return cmd_backfill(config, args.playlist, args.limit, args.force)
+            case "status":
+                return cmd_status(config, args.limit, args.status)
+            case "retry":
+                return cmd_retry(config, None if args.all else args.video_id)
+            case "reset":
+                return cmd_reset(config, args.video_id)
+            case "health":
+                return cmd_health(config, args.alert)
             case "test-notify":
                 return cmd_test_notify(config, args.channel)
             case "doctor":

@@ -1,0 +1,17 @@
+# /etc/systemd/system/guetteur-health.service — lancé par guetteur-health.timer
+[Unit]
+Description=GUETTEUR - healthcheck (alerte Telegram si KO, au plus une par heure)
+ConditionPathExists=/opt/guetteur/.env
+
+[Service]
+Type=oneshot
+User=guetteur
+Group=guetteur
+WorkingDirectory=/opt/guetteur
+EnvironmentFile=/opt/guetteur/.env
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# Code retour 1 si KO : l'unité apparaît en échec dans systemctl, et l'alerte part.
+ExecStart=/usr/local/bin/uv run --no-sync guetteur health --alert
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full

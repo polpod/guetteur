@@ -39,6 +39,11 @@ def test_claim_for_sending_only_once(store: Store) -> None:
     assert store.claim_for_sending("v1") is True
     assert store.claim_for_sending("v1") is False
     rec = store.get("v1")
+    assert rec is not None and rec.status is Status.SENDING and rec.send_attempt_at is not None
+    assert rec.sent_at is None
+    assert store.mark_sent("v1") is True
+    assert store.claim_for_sending("v1") is False
+    rec = store.get("v1")
     assert rec is not None and rec.status is Status.SENT and rec.sent_at is not None
 
 
@@ -60,6 +65,7 @@ def test_release_claim_allows_single_resend(store: Store) -> None:
 def test_sent_video_cannot_be_downgraded(store: Store) -> None:
     _ready(store, "v1")
     store.claim_for_sending("v1")
+    store.mark_sent("v1")
     store.set_summary("v1", "autre")
     store.mark_retry("v1", "err")
     assert store.mark_failed("v1", "err") is False
@@ -70,6 +76,7 @@ def test_sent_video_cannot_be_downgraded(store: Store) -> None:
 def test_add_new_does_not_resurrect_sent_video(store: Store) -> None:
     _ready(store, "v1")
     store.claim_for_sending("v1")
+    store.mark_sent("v1")
     assert store.add_new(_video("v1"), "PL") is False
     assert store.pending(10) == []
 
@@ -78,6 +85,7 @@ def test_backfill_requeue_never_touches_really_sent(store: Store) -> None:
     store.initialize_playlist("PL", [_video("skipped")])
     _ready(store, "real")
     store.claim_for_sending("real")
+    store.mark_sent("real")
 
     assert store.requeue_for_backfill(_video("skipped"), "PL") is True
     assert store.requeue_for_backfill(_video("real"), "PL") is False

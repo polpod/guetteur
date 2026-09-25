@@ -10,8 +10,10 @@ from typing import Any, Literal
 
 import httpx
 
-from guetteur.config import Config
+from guetteur.config import Config, NotifyChannel
+from guetteur.notify.base import Notifier
 from guetteur.notify.telegram import TelegramNotifier
+from guetteur.notify.whatsapp_cloud import WhatsAppCloudNotifier
 from guetteur.pipeline import Pipeline
 from guetteur.sources.rss import RssSource
 from guetteur.store import Store
@@ -41,6 +43,8 @@ class World:
         self.backend = backend
         self.feed: list[tuple[str, str, str]] = list(OLD)
         self.telegram: list[dict[str, Any]] = []
+        self.whatsapp: list[dict[str, Any]] = []
+        self.sleeps: list[float] = []  # attentes entre tentatives (aucune attente réelle)
         self.store = Store(config.db_path)
         self.transcriber = FakeTranscriber(missing={NOSUB[0]})
         self.claude = fake_anthropic()
@@ -52,6 +56,7 @@ class World:
 
         rss = RssSource(httpx.Client(transport=httpx.MockTransport(youtube)))
         self.telegram_notifier = self.make_telegram(self._telegram_ok)
+        self.whatsapp_notifier = self.make_whatsapp(self._whatsapp_ok)
 
         summarizer: Summarizer
         if backend == "claude_api":
@@ -69,13 +74,34 @@ class World:
             source_factory=lambda _p: rss,
             transcriber=self.transcriber,
             summarizer=summarizer,
-            notifier_factory=lambda _c: self.telegram_notifier,
+            notifier_factory=self._notifier_for,
+            sleep=self.sleeps.append,
         )
+
+    def _notifier_for(self, channel: NotifyChannel) -> Notifier:
+        return self.telegram_notifier if channel == "telegram" else self.whatsapp_notifier
 
     def _telegram_ok(self, request: httpx.Request) -> httpx.Response:
         assert request.url.host == "api.telegram.org"
         self.telegram.append(json.loads(request.content))
-        return httpx.Response(200, json={"ok": True})
+        n = len(self.telegram)
+        return httpx.Response(200, json={"ok": True, "result": {"message_id": 1000 + n}})
+
+    def _whatsapp_ok(self, request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "graph.facebook.com"
+        self.whatsapp.append(json.loads(request.content))
+        return httpx.Response(200, json={"messages": [{"id": f"wamid.{len(self.whatsapp)}"}]})
+
+    @staticmethod
+    def make_whatsapp(
+        handler: Callable[[httpx.Request], httpx.Response],
+    ) -> WhatsAppCloudNotifier:
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        return WhatsAppCloudNotifier("WA", "PHONE", "33600000000", client=client)
+
+    def replace_whatsapp(self, handler: Callable[[httpx.Request], httpx.Response]) -> None:
+        self.whatsapp_notifier = self.make_whatsapp(handler)
+        self.pipeline._notifiers.clear()
 
     @staticmethod
     def make_telegram(handler: Callable[[httpx.Request], httpx.Response]) -> TelegramNotifier:

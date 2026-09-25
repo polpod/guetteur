@@ -7,7 +7,28 @@ from dataclasses import dataclass
 
 
 class NotifyError(RuntimeError):
-    """Échec d'envoi d'une notification."""
+    """Échec d'envoi d'une notification.
+
+    retryable=True : panne a priori passagère (5xx, 429, timeout, réseau) → nouvel essai.
+    retryable=False : erreur de configuration ou de contenu (401, 403, 404, 400 « chat not
+    found »…) → inutile de réessayer, la vidéo passe en « failed » avec cette raison."""
+
+    def __init__(
+        self,
+        message: str,
+        retryable: bool = False,
+        status_code: int | None = None,
+        retry_after: float | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+        self.status_code = status_code
+        self.retry_after = retry_after
+
+
+def is_retryable_status(status_code: int) -> bool:
+    """5xx et 429 (limite de débit) sont passagers ; les autres 4xx sont définitifs."""
+    return status_code == 429 or status_code >= 500
 
 
 @dataclass(frozen=True)
@@ -24,8 +45,9 @@ class Notifier(ABC):
     name: str = "base"
 
     @abstractmethod
-    def send(self, message: Message) -> None:
-        """Envoie le message ; lève NotifyError en cas d'échec."""
+    def send(self, message: Message) -> str | None:
+        """Envoie le message et retourne l'identifiant attribué par le fournisseur (s'il y en
+        a un) ; lève NotifyError en cas d'échec."""
 
 
 def _safe_cut(text: str, limit: int) -> int:

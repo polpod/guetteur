@@ -124,10 +124,12 @@ def notify_failure_is_retried_without_resummarizing(make: WorldFactory) -> None:
     w.feed.append(NEW)
 
     calls = {"n": 0}
+    attempts = w.config.notify.max_attempts
 
     def flaky(request: httpx.Request) -> httpx.Response:
+        # Panne passagère qui dure toute la première série de tentatives du cycle.
         calls["n"] += 1
-        if calls["n"] == 1:
+        if calls["n"] <= attempts:
             return httpx.Response(502, json={"ok": False, "description": "gateway"})
         w.telegram.append(json.loads(request.content))
         return httpx.Response(200, json={"ok": True})
@@ -137,6 +139,8 @@ def notify_failure_is_retried_without_resummarizing(make: WorldFactory) -> None:
     assert w.pipeline.run_cycle().sent == 0
     rec = w.store.get(NEW[0])
     assert rec is not None and rec.status is Status.SUMMARIZED and rec.sent_at is None
+
+    assert w.sleeps == [2.0, 8.0]  # attentes entre les 3 tentatives, sans attente réelle
 
     assert w.pipeline.run_cycle().sent == 1
     assert len(w.telegram) == 1

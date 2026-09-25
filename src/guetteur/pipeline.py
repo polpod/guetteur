@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import timedelta
 
 from guetteur.config import Config, ConfigError, NotifyChannel, PlaylistConfig
 from guetteur.models import Segment, Summary, Transcript, Video
 from guetteur.notify.base import Message, Notifier, NotifyError
 from guetteur.sources.base import SourceError, VideoSource
-from guetteur.store import Status, Store, VideoRecord
+from guetteur.store import PENDING_STATUSES, Status, Store, VideoRecord
 from guetteur.summarize.base import (
     SummarizeError,
     Summarizer,
@@ -26,6 +28,8 @@ from guetteur.transcript.base import NoTranscriptError, TranscriptError, Transcr
 log = logging.getLogger(__name__)
 
 
+MAX_RETRY_AFTER_S = 60.0
+
 SourceFactory = Callable[[PlaylistConfig], VideoSource]
 NotifierFactory = Callable[[NotifyChannel], Notifier]
 
@@ -36,6 +40,8 @@ class CycleStats:
     processed: int = 0
     sent: int = 0
     failed: int = 0
+    recovered: int = 0  # envois « sending » périmés repris en début de cycle
+    skipped: int = 0  # backfill : vidéos déjà envoyées ou « failed » sans --force
     aborted: str = ""  # raison si le cycle a été interrompu (backend de résumé indisponible)
 
 
@@ -77,6 +83,7 @@ class Pipeline:
         transcriber: TranscriptProvider,
         summarizer: Summarizer,
         notifier_factory: NotifierFactory,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self._config = config
         self._store = store
@@ -85,6 +92,7 @@ class Pipeline:
         self._summarizer = summarizer
         self._notifier_factory = notifier_factory
         self._notifiers: dict[NotifyChannel, Notifier] = {}
+        self._sleep = sleep
 
     # --- découverte ------------------------------------------------------------------------
 
@@ -113,8 +121,17 @@ class Pipeline:
 
     # --- traitement ------------------------------------------------------------------------
 
+    def recover_stale_sending(self) -> int:
+        timeout = timedelta(minutes=self._config.notify.sending_timeout_min)
+        recovered = self._store.recover_stale_sending(timeout)
+        for vid in recovered:
+            log.warning("video.sending_recovered", extra={"video_id": vid})
+        return len(recovered)
+
     def run_cycle(self) -> CycleStats:
-        stats = CycleStats(discovered=self.poll())
+        self._store.beat()
+        recovered = self.recover_stale_sending()
+        stats = CycleStats(discovered=self.poll(), recovered=recovered)
         ids = [p.id for p in self._config.playlists]
         try:
             for record in self._store.pending(self._config.max_videos_per_cycle, ids):
@@ -122,22 +139,46 @@ class Pipeline:
         except SummarizerUnavailableError as exc:
             stats.aborted = str(exc)
             log.error("cycle.summarizer_unavailable", extra={"error": str(exc)})
+        self._store.beat()
         log.info("cycle.done", extra={**vars(stats), "db": self._store.counts()})
         return stats
 
-    def backfill(self, playlist_id: str, limit: int) -> CycleStats:
+    def backfill(self, playlist_id: str, limit: int, force: bool = False) -> CycleStats:
         """Traite explicitement les `limit` vidéos les plus récentes d'une playlist, y compris
-        celles ignorées au premier lancement. Les vidéos déjà envoyées ne sont jamais renvoyées."""
+        celles ignorées au premier lancement. Seul le statut « sent » (réellement envoyé) vaut
+        « déjà envoyée » ; les « failed » ne sont reprises qu'avec force=True."""
         playlist = self._config.playlist(playlist_id)
         videos = self._source_factory(playlist).fetch(playlist.id)
         if not self._store.is_playlist_initialized(playlist.id):
             self._store.initialize_playlist(playlist.id, videos)
-        stats = CycleStats()
+        stats = CycleStats(recovered=self.recover_stale_sending())
         for video in videos[:limit]:
-            if self._store.requeue_for_backfill(video, playlist.id):
+            if self._store.requeue_for_backfill(video, playlist.id, force=force):
                 stats.discovered += 1
             record = self._store.get(video.video_id)
-            if record is not None and record.sent_at is None and record.status != Status.SENT:
+            if record is None:
+                continue
+            ctx = {"video_id": record.video_id, "status": record.status.value}
+            if record.really_sent:
+                log.info("backfill.already_sent", extra=ctx)
+                stats.skipped += 1
+                continue
+            if record.status is Status.FAILED:
+                log.warning(
+                    "backfill.skipped_failed",
+                    extra={
+                        **ctx,
+                        "error": record.last_error,
+                        "hint": "guetteur retry --video-id ou backfill --force",
+                    },
+                )
+                stats.skipped += 1
+                continue
+            if record.status is Status.SENDING:
+                log.info("backfill.sending_in_progress", extra=ctx)
+                stats.skipped += 1
+                continue
+            if record.status in PENDING_STATUSES:
                 try:
                     self._process_safely(record, stats)
                 except SummarizerUnavailableError as exc:
@@ -168,6 +209,7 @@ class Pipeline:
             return PlaylistConfig(id=record.playlist_id, label=record.playlist_id)
 
     def _notifier(self, channel: NotifyChannel) -> Notifier:
+        """Notifier du canal (mis en cache). Jetons manquants → NotifyError non retryable."""
         if channel not in self._notifiers:
             self._notifiers[channel] = self._notifier_factory(channel)
         return self._notifiers[channel]
@@ -202,19 +244,91 @@ class Pipeline:
             log.info("video.summarized", extra=ctx)
 
         if not self._store.claim_for_sending(vid):
-            log.warning("video.already_sent", extra=ctx)
+            current = self._store.get(vid)
+            state = current.status.value if current else "inconnue"
+            log.warning("video.not_claimable", extra={**ctx, "status": state})
             return "skipped"
-        try:
-            self._notifier(playlist.notify).send(build_message(summary, video, playlist.label))
-        except NotifyError as exc:
-            retries = self._store.release_claim(vid, str(exc))
-            log.error("video.notify_failed", extra={**ctx, "error": str(exc), "retries": retries})
+        return self._deliver(vid, playlist, build_message(summary, video, playlist.label))
+
+    # --- envoi -----------------------------------------------------------------------------
+
+    def _delay(self, attempt: int, exc: NotifyError) -> float:
+        delays = self._config.notify.retry_delays_s
+        delay = delays[min(attempt - 1, len(delays) - 1)]
+        if exc.retry_after is not None:  # 429 : le fournisseur indique combien attendre
+            delay = max(delay, min(exc.retry_after, MAX_RETRY_AFTER_S))
+        return delay
+
+    def _channels(self, playlist: PlaylistConfig) -> list[tuple[NotifyChannel, bool]]:
+        channels: list[tuple[NotifyChannel, bool]] = [(playlist.notify, False)]
+        fallback = self._config.notify.fallback
+        if fallback is not None and fallback != playlist.notify:
+            channels.append((fallback, True))
+        return channels
+
+    def _deliver(self, vid: str, playlist: PlaylistConfig, message: Message) -> str:
+        """Envoie une vidéo déjà réclamée (« sending ») : tentatives avec attente croissante
+        sur erreur passagère, puis canal de secours après un échec définitif du principal.
+        Chaque tentative est tracée dans deliveries."""
+        max_attempts = self._config.notify.max_attempts
+        reasons: list[str] = []
+        transient = False
+        for channel, is_fallback in self._channels(playlist):
+            ctx = {"video_id": vid, "channel": channel, "fallback": is_fallback}
+            last: NotifyError | None = None
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    provider_id = self._notifier(channel).send(message)
+                except NotifyError as exc:
+                    last = exc
+                    self._store.add_delivery(
+                        vid, channel, attempt, ok=False, error=str(exc), is_fallback=is_fallback
+                    )
+                    log.warning(
+                        "notify.attempt_failed",
+                        extra={
+                            **ctx,
+                            "attempt": attempt,
+                            "retryable": exc.retryable,
+                            "error": str(exc),
+                        },
+                    )
+                    if not exc.retryable or attempt == max_attempts:
+                        break
+                    self._sleep(self._delay(attempt, exc))
+                    continue
+                self._store.add_delivery(
+                    vid,
+                    channel,
+                    attempt,
+                    ok=True,
+                    provider_message_id=provider_id,
+                    is_fallback=is_fallback,
+                )
+                self._store.mark_sent(vid)
+                log.info("video.sent", extra={**ctx, "attempt": attempt})
+                return "sent"
+            if last is not None:
+                kind = "passagère" if last.retryable else "définitive"
+                reasons.append(f"{channel} ({kind}) : {last}")
+                transient = transient or last.retryable
+
+        reason = " | ".join(reasons) or "aucun canal disponible"
+        if transient:
+            # Au moins un canal a échoué de façon passagère : on retentera au prochain cycle.
+            retries = self._store.release_claim(vid, reason)
+            log.error(
+                "video.notify_failed", extra={"video_id": vid, "retries": retries, "error": reason}
+            )
             if retries > self._config.transcript.max_retries:
-                self._store.mark_failed(vid, str(exc))
+                self._store.mark_failed(vid, reason)
+                log.error("video.failed", extra={"video_id": vid, "error": reason})
                 return "failed"
             return "retry"
-        log.info("video.sent", extra={**ctx, "channel": playlist.notify})
-        return "sent"
+        # Erreur de configuration partout : inutile d'insister, raison lisible en base.
+        self._store.mark_failed(vid, reason)
+        log.error("video.failed", extra={"video_id": vid, "error": reason, "retryable": False})
+        return "failed"
 
     def _retry_or_fail(self, record: VideoRecord, error: str, notify: bool) -> str:
         vid = record.video_id

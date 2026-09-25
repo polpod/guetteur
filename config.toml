@@ -20,6 +20,12 @@ provider = "claude_code"
 claude_code_bin = "claude"  # nom dans le PATH ou chemin absolu
 timeout_s = 180             # délai maximal par appel (secondes)
 
+[notify]
+fallback = "telegram"             # canal de secours après un échec définitif ("" = aucun)
+max_attempts = 3                  # tentatives par canal sur erreur passagère (5xx, 429, timeout)
+retry_delays_s = [2, 8, 30]       # attente après la 1re, 2e, 3e tentative ratée
+sending_timeout_min = 10          # un envoi « sending » plus ancien est repris au cycle suivant
+
 [whatsapp]
 api_version = "v20.0"
 # Modèle (template) envoyé si la fenêtre de 24 h est fermée. « hello_world » existe par défaut

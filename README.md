@@ -42,8 +42,10 @@ Chaque résumé contient :
 playlists (RSS ou YouTube Data API)
         │  toutes les N secondes (300 par défaut)
         ▼
-  SQLite data/guetteur.db ── new ─► transcribed ─► summarized ─► sent
-        │                        │                       └─► failed (après 3 nouveaux essais)
+  SQLite data/guetteur.db ── new ─► transcribed ─► summarized ─► sending ─► sent
+        │                        │                  ▲              │
+        │                        │                  └── (5xx, 429, ├─► failed (4xx de config,
+        │                        │                     timeout)    │    ou essais épuisés)
         │                        └─► retry (pas de sous-titres, 3 cycles max)
         ▼
  sous-titres YouTube (fr → en → n'importe quelle langue)
@@ -56,10 +58,25 @@ playlists (RSS ou YouTube Data API)
 - **Premier lancement** : les vidéos déjà présentes dans une playlist sont marquées `sent` sans
   être traitées. Seules les vidéos publiées ensuite sont résumées. Pour traiter l'existant,
   utilisez `guetteur backfill`.
-- **Idempotence stricte** : juste avant l'envoi, la vidéo passe de `summarized` à `sent` dans
-  une seule transaction SQLite atomique. Une vidéo ne peut donc être envoyée qu'une fois, même
-  si le service redémarre. Si l'envoi échoue, elle repasse en `summarized` et un nouvel essai
-  aura lieu au cycle suivant, sans rappeler Claude.
+- **Envoi** : juste avant l'envoi, la vidéo passe atomiquement de `summarized` à `sending`
+  (horodatée par `send_attempt_at`) : deux processus ne peuvent pas l'envoyer en même temps.
+  Elle ne passe `sent` qu'une fois le message accepté par le canal.
+- **Erreurs d'envoi** :
+  - *passagères* (5xx, 429, timeout, réseau) : 3 tentatives dans le cycle, séparées de 2 s
+    puis 8 s (`[notify] retry_delays_s`, le `Retry-After` d'un 429 est respecté). Si elles
+    échouent toutes, la vidéo repasse en `summarized` et sera retentée au cycle suivant, sans
+    rappeler Claude, jusqu'à `max_retries` cycles ;
+  - *de configuration* (401, 403, 404, 400 « chat not found »…) : aucune nouvelle tentative,
+    la vidéo passe en `failed` avec la raison en base (`last_error`) et dans le log, et le
+    cycle continue avec les autres vidéos. Une fois la configuration corrigée :
+    `guetteur retry --video-id X` (ou `--all`).
+- **Canal de secours** : `[notify] fallback = "telegram"`. Après un échec définitif sur le
+  canal principal de la playlist, le message est tenté sur le secours ; s'il passe, la vidéo
+  est `sent` et la ligne `deliveries` correspondante est marquée `is_fallback = 1`.
+- **Traçabilité** : chaque tentative est une ligne de la table `deliveries` (canal, numéro de
+  tentative, succès, identifiant du message chez le fournisseur, erreur).
+- **Envoi interrompu** : une vidéo restée en `sending` plus de 10 min (processus tué pendant
+  l'envoi) repasse en `summarized` au début du cycle suivant ; le résumé est conservé.
 - **Pas de transcription** : sans sous-titres et avec whisper désactivé, la vidéo passe en
   `retry`. Elle est retentée pendant 3 cycles, puis abandonnée (`failed`) et un message
   « pas de transcription » est envoyé.
@@ -104,35 +121,67 @@ claude -p "<consigne + métadonnées>" --output-format json --model <claude_mode
 C'est le mode recommandé avec le backend `claude_code` : l'image Docker ne contient pas
 Claude Code.
 
-### 1. Créer le conteneur
+### 1. Créer le conteneur et installer (sur l'hôte Proxmox)
 
-Suivez l'étape 1 de la [section Docker](#1-créer-le-conteneur-lxc) (Debian 12, 2 cœurs,
-1 Go de RAM). Les options `nesting`/`keyctl` sont inutiles sans Docker.
+Sur l'hôte Proxmox, en root :
 
-### 2. Lancer le script d'installation
+```bash
+git clone https://github.com/polpod/guetteur.git /root/guetteur   # ou scp -r du dossier
+bash /root/guetteur/scripts/proxmox-create-lxc.sh 120 local-lvm vmbr0   # CTID STORAGE BRIDGE
+```
+
+`scripts/proxmox-create-lxc.sh` :
+
+- télécharge le dernier modèle `debian-12-standard` s'il manque ;
+- crée un LXC **non privilégié** : 2 vCPU, 2 Go de RAM, disque de 16 Go, DHCP sur le pont
+  choisi, démarrage automatique ;
+- le démarre, attend que le réseau réponde ;
+- y copie puis exécute `install-lxc.sh` (`pct push` puis `pct exec`).
+
+Il est **idempotent** : si le CTID existe déjà, il n'est pas recréé, il est seulement
+démarré et l'installation est relancée (mise à jour). Par sécurité, il refuse un CTID
+existant qui porte un autre nom d'hôte que `guetteur` (sauf `FORCE=1`).
+
+`scripts/install-lxc.sh` (dans le LXC, relançable sans risque) :
+
+1. vérifie et installe `git`, `curl`, `ffmpeg`, **uv** (script officiel), **Node.js 22**
+   (NodeSource) et **Claude Code** (`npm i -g @anthropic-ai/claude-code`) ;
+2. crée l'utilisateur système `guetteur`, avec un vrai `HOME` pour la session Claude ;
+3. clone `git@github.com:polpod/guetteur.git` dans `/opt/guetteur`, ou en HTTPS si SSH
+   échoue (dépôt privé : ajoutez une *deploy key*, ou passez `REPO_URL=…`) ;
+4. installe Python 3.12 et lance `uv sync --frozen --no-dev` ;
+5. installe la commande `/usr/local/bin/guetteur`, qui lance la CLI sous l'utilisateur
+   `guetteur` depuis `/opt/guetteur` ;
+6. installe `guetteur.service`, `guetteur-health.service` et `guetteur-health.timer`,
+   **désactivés** tant que `.env` et la session Claude ne sont pas en place ;
+7. affiche les 4 commandes restantes :
+
+```bash
+install -m 600 -o guetteur -g guetteur /root/.env /opt/guetteur/.env   # après scp .env root@<ip>:/root/.env
+sudo -u guetteur -i claude auth login
+guetteur doctor
+systemctl enable --now guetteur
+```
+
+### 2. Mettre à jour
 
 Dans le LXC, en root :
 
 ```bash
-apt update && apt install -y git
-git clone <url-de-votre-dépôt> /root/guetteur-src
-REPO_URL=<url-de-votre-dépôt> bash /root/guetteur-src/scripts/install-lxc.sh
-# ou, sans dépôt git : copiez le projet (scp -r) puis lancez bash scripts/install-lxc.sh
+bash /opt/guetteur/scripts/deploy.sh   # git pull, uv sync --no-dev, restart, 30 lignes de journal
 ```
 
-`scripts/install-lxc.sh` :
+### Healthcheck
 
-1. installe `ffmpeg`, `git`, `curl` et `sqlite3` ;
-2. installe **Node.js 22** (NodeSource), puis **Claude Code** avec
-   `npm i -g @anthropic-ai/claude-code` ;
-3. installe **uv** dans `/usr/local/bin`, puis **Python 3.12** avec `uv python install` ;
-4. crée l'utilisateur système `guetteur`, avec un vrai `HOME` pour la session Claude ;
-5. clone (ou copie) le projet dans `/opt/guetteur`, puis lance
-   `uv sync --frozen --no-dev` (ajoutez `WITH_WHISPER=1` pour whisper) ;
-6. crée `/opt/guetteur/.env` (mode 600) à partir de `.env.example` ;
-7. installe et active `deploy/guetteur.service`, sans le démarrer.
+`guetteur-health.timer` lance `guetteur health --alert` toutes les 15 minutes (il démarre
+avec le service). `health` vérifie que la base répond et que le dernier cycle date de moins
+de 3 fois `poll_interval_seconds`. Si ce n'est pas le cas, une alerte Telegram part, **au
+plus une par heure**.
 
-Relancer le script met l'installation à jour (`git pull` puis `uv sync`).
+```bash
+systemctl list-timers guetteur-health.timer
+journalctl -u guetteur-health -n 20
+```
 
 ### 3. Connecter Claude Code pour l'utilisateur `guetteur` (en SSH)
 
@@ -154,7 +203,7 @@ sudo -u guetteur -i claude auth login
 
    ```bash
    sudo -u guetteur -i claude auth status                  # "loggedIn": true
-   cd /opt/guetteur && sudo -u guetteur -H uv run --no-sync guetteur doctor
+   guetteur doctor
    ```
 
 La session est stockée dans `/home/guetteur/.claude/` et se renouvelle automatiquement.
@@ -169,9 +218,9 @@ Si `doctor` affiche `claude : session  KO  … not logged in`, relancez `claude 
 ```bash
 nano /opt/guetteur/.env          # jetons Telegram / WhatsApp (pas de clé Anthropic requise)
 nano /opt/guetteur/config.toml   # playlists ; [summarize] provider = "claude_code"
-cd /opt/guetteur && sudo -u guetteur -H uv run --no-sync guetteur doctor
-sudo -u guetteur -H uv run --no-sync guetteur test-notify
-systemctl start guetteur
+guetteur doctor
+guetteur test-notify
+systemctl enable --now guetteur
 journalctl -u guetteur -f
 ```
 
@@ -424,13 +473,24 @@ uv run guetteur test-notify
 uv run guetteur once
 uv run guetteur run
 uv run guetteur backfill --playlist PLxxx --limit 5
+uv run guetteur status                      # tableau des vidéos et de leur état
+uv run guetteur retry --all                 # remet en file les vidéos « failed »
+uv run guetteur health                      # base OK et dernier cycle récent
 ```
+
+Dans le LXC, la commande `guetteur` fait la même chose (`guetteur status`, `guetteur retry
+--all`…), sous le bon utilisateur et depuis `/opt/guetteur`. Aucune de ces commandes ne
+nécessite `sqlite3`.
 
 | Commande | Rôle |
 |---|---|
 | `run` | Service : un cycle immédiatement, puis un cycle toutes les `poll_interval_seconds` secondes. |
 | `once` | Un seul cycle. Code retour 1 si une vidéo est passée en `failed`. |
-| `backfill --playlist ID --limit N` | Traite les N vidéos les plus récentes de la playlist, y compris celles ignorées au premier lancement. Une vidéo réellement envoyée ne l'est jamais une seconde fois. |
+| `backfill --playlist ID --limit N [--force]` | Traite les N vidéos les plus récentes de la playlist, y compris celles ignorées au premier lancement. Seul le statut `sent` vaut « déjà envoyée » : une vidéo réellement envoyée ne l'est jamais une seconde fois. Les vidéos `failed` ne sont reprises qu'avec `--force`. |
+| `status [--limit 30] [--status failed]` | Tableau : id, titre tronqué, playlist, statut, retries, dernière erreur ; puis les totaux par statut et l'heure du dernier cycle. |
+| `retry --video-id X` / `retry --all` | Remet une vidéo `failed` (ou toutes) en file avec `retries = 0`. Elle reprend là où elle en était (`summarized` si le résumé existe : pas de rappel Claude). |
+| `reset --video-id X` | Retraitement complet : repasse en `new` et efface transcription, résumé et état d'envoi. Avertit si la vidéo avait déjà été envoyée. |
+| `health [--alert]` | Base OK et dernier cycle datant de moins de 3 intervalles. Code retour 1 si KO. `--alert` : alerte Telegram si KO, au plus une par heure (timer systemd). |
 | `doctor` | Tableau OK/KO : binaire `claude` trouvé et connecté (`claude -p "ping" --output-format json` doit répondre), ffmpeg, base SQLite, jetons des canaux utilisés (et `ANTHROPIC_API_KEY` si `provider = "claude_api"`). Code retour 1 si une ligne est KO. |
 | `test-notify [--channel …]` | Envoie un faux résumé (avec des caractères spéciaux) pour valider l'échappement et les liens. |
 | `auth [--port 8765] [--bind …]` | Autorisation OAuth pour les playlists privées. |
@@ -456,6 +516,10 @@ Option globale : `--config chemin/config.toml` (ou la variable `GUETTEUR_CONFIG`
 | `transcript.whisper_enabled` | `false` | Active le secours yt-dlp + faster-whisper. Nécessite de construire l'image avec `WITH_WHISPER: "1"` dans `docker-compose.yml`. |
 | `transcript.whisper_model` | `small` | Modèle faster-whisper, exécuté sur CPU en int8. |
 | `transcript.max_retries` | `3` | Nombre de nouveaux essais (un par cycle) avant abandon. |
+| `notify.fallback` | *(aucun)* | Canal de secours (`telegram` ou `whatsapp`) après un échec définitif du canal principal. `config.toml` fourni : `"telegram"`. |
+| `notify.max_attempts` | `3` | Tentatives par canal sur erreur passagère (5xx, 429, timeout). |
+| `notify.retry_delays_s` | `[2, 8, 30]` | Attente après la 1re, 2e, 3e tentative ratée (la dernière valeur sert au-delà). |
+| `notify.sending_timeout_min` | `10` | Une vidéo en `sending` depuis plus longtemps est reprise au cycle suivant. |
 | `whatsapp.*` | | Version de l'API Graph et modèle utilisé hors fenêtre de 24 h. |
 | `[[playlists]]` | | `id`, `label`, `language` (langue du résumé), `notify` (`telegram` ou `whatsapp`), `private`. |
 
@@ -483,8 +547,10 @@ src/guetteur/
   config.py            # config.toml + secrets depuis l'environnement
   main.py              # CLI et boucle schedule
   doctor.py            # guetteur doctor
+  health.py            # guetteur health (heartbeat, alerte Telegram limitée)
+  tables.py            # tableaux texte de la CLI (status, health)
   pipeline.py          # orchestration séquentielle (poll → transcription → résumé → envoi)
-  store.py             # SQLite, machine à états, idempotence
+  store.py             # SQLite : machine à états, deliveries, heartbeat, migration Lot 1
   logs.py              # logs JSON
   sources/             # rss.py (feedparser), api.py (YouTube Data API v3 + OAuth)
   transcript/          # youtube.py (youtube_transcript_api), whisper.py (yt-dlp + faster-whisper)
@@ -492,14 +558,20 @@ src/guetteur/
                        # claude_code.py (binaire claude -p), claude_api.py (SDK anthropic)
                        # format.py (MarkdownV2 / texte)
   notify/              # base.py (Notifier), telegram.py, whatsapp_cloud.py
-scripts/install-lxc.sh # installation sans Docker (Debian 12)
-deploy/guetteur.service
+scripts/proxmox-create-lxc.sh  # sur l'hôte Proxmox : crée le LXC puis lance install-lxc.sh
+scripts/install-lxc.sh         # dans le LXC : outils, dépôt, uv sync, unités systemd
+scripts/deploy.sh              # dans le LXC : git pull, uv sync, restart, journal
+deploy/guetteur.service        # service principal
+deploy/guetteur-health.*       # healthcheck toutes les 15 min (service + timer)
 tests/
   test_*.py            # RSS, découpage/échappement, store, backends (SDK et subprocess mockés),
                        # notifieurs, config, doctor
   e2e/scenarios.py     # scénarios communs aux deux backends
   e2e/test_pipeline.py              # backend claude_api (SDK mocké)
   e2e/test_pipeline_claude_code.py  # backend claude_code (subprocess mocké) + pannes du binaire
+  e2e/test_delivery_failover.py     # principal en 5xx ×3 → secours, 4 lignes deliveries
+  e2e/test_config_error_not_retried.py  # 403 : pas de retry, failed, puis guetteur retry
+  e2e/test_backfill_after_failed_send.py  # bug du Lot 1 : failed puis backfill « already_sent »
 ```
 
 ---
@@ -524,8 +596,13 @@ tests/
   HTTP. Meta peut accepter le message (HTTP 200), puis signaler l'échec plus tard par webhook,
   que GUETTEUR n'écoute pas. Dans ce cas, le message est perdu en silence. Gardez la fenêtre
   ouverte en écrivant régulièrement au numéro.
-- **Au plus une fois** : si le processus est tué pendant l'envoi, la vidéo reste `sent` et
-  n'est pas renvoyée. C'est le prix de la garantie « jamais deux fois ».
+- **Envoi interrompu** : si le processus est tué *après* que le canal a accepté le message
+  mais *avant* l'écriture de `sent`, la vidéo est reprise au bout de 10 min et le message
+  part une seconde fois. Cette fenêtre (quelques millisecondes) est le prix de la reprise
+  automatique des envois interrompus.
+- **Messages en plusieurs parties** : un résumé de plus de 4096 caractères part en plusieurs
+  messages Telegram. Si une partie échoue en erreur passagère, les nouvelles tentatives
+  renvoient tout le résumé : les premières parties peuvent arriver en double.
 - **Une vidéo présente dans deux playlists** n'est résumée et envoyée qu'une seule fois, pour
   la première playlist où elle a été vue.
 - **Durée de lecture** : elle est calculée sur la base de 200 mots par minute, pas estimée par

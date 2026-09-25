@@ -12,7 +12,13 @@ from typing import Any
 import httpx
 
 from guetteur.config import WhatsAppConfig
-from guetteur.notify.base import Message, Notifier, NotifyError, split_message
+from guetteur.notify.base import (
+    Message,
+    Notifier,
+    NotifyError,
+    is_retryable_status,
+    split_message,
+)
 
 log = logging.getLogger(__name__)
 
@@ -57,8 +63,12 @@ class WhatsAppCloudNotifier(Notifier):
         body.update(payload)
         try:
             resp = self._client.post(self._url, json=body, headers=self._headers)
+        except httpx.TimeoutException as exc:
+            raise NotifyError("WhatsApp : délai dépassé", retryable=True) from exc
         except httpx.HTTPError as exc:
-            raise NotifyError(f"WhatsApp injoignable : {type(exc).__name__}") from exc
+            raise NotifyError(
+                f"WhatsApp injoignable : {type(exc).__name__}", retryable=True
+            ) from exc
         try:
             data: dict[str, Any] = resp.json()
         except ValueError:
@@ -69,13 +79,26 @@ class WhatsAppCloudNotifier(Notifier):
             msg = err.get("message", resp.text)
             if code in WINDOW_CLOSED_CODES:
                 raise WindowClosedError(f"WhatsApp {code} : {msg}")
-            raise NotifyError(f"WhatsApp HTTP {resp.status_code} (code {code}) : {msg}")
+            status = resp.status_code if resp.status_code >= 400 else 400
+            raise NotifyError(
+                f"WhatsApp HTTP {resp.status_code} (code {code}) : {msg}",
+                retryable=is_retryable_status(status),
+                status_code=status,
+            )
         return data
 
-    def _send_text(self, text: str) -> None:
-        self._post({"type": "text", "text": {"preview_url": True, "body": text}})
+    @staticmethod
+    def _message_id(data: dict[str, Any]) -> str | None:
+        messages = data.get("messages") or [{}]
+        message_id = messages[0].get("id") if isinstance(messages[0], dict) else None
+        return str(message_id) if message_id else None
 
-    def _send_template(self, message: Message) -> None:
+    def _send_text(self, text: str) -> str | None:
+        return self._message_id(
+            self._post({"type": "text", "text": {"preview_url": True, "body": text}})
+        )
+
+    def _send_template(self, message: Message) -> str | None:
         template: dict[str, Any] = {
             "name": self._settings.template_name,
             "language": {"code": self._settings.template_language},
@@ -85,16 +108,16 @@ class WhatsAppCloudNotifier(Notifier):
             template["components"] = [
                 {"type": "body", "parameters": [{"type": "text", "text": param}]}
             ]
-        self._post({"type": "template", "template": template})
+        return self._message_id(self._post({"type": "template", "template": template}))
 
-    def send(self, message: Message) -> None:
+    def send(self, message: Message) -> str | None:
         parts = split_message(message.plain, WHATSAPP_TEXT_LIMIT)
         try:
-            self._send_text(parts[0])
+            first = self._send_text(parts[0])
         except WindowClosedError:
             log.warning("whatsapp.window_closed", extra={"template": self._settings.template_name})
-            self._send_template(message)
-            return
+            return self._send_template(message)
         for part in parts[1:]:
             self._send_text(part)
         log.info("whatsapp.sent", extra={"parts": len(parts)})
+        return first
