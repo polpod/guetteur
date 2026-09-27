@@ -365,13 +365,50 @@ def _sample_message() -> tuple[Summary, Video]:
     return summary, video
 
 
-def cmd_compare(config: Config, video_id: str, channel: NotifyChannel | None = None) -> int:
-    """Génère les 3 niveaux de détail pour la même vidéo et envoie chacun sur le canal
+def _parse_detail_filter(raw: str | None) -> tuple[DetailLevel, ...]:
+    """Parse la valeur de `guetteur compare --detail`.
+
+    - Non fourni (None ou vide) → les trois niveaux.
+    - Un ou plusieurs niveaux séparés par des virgules (`bref` ou `bref,detaille`).
+    - Ordre du CLI conservé et doublons ignorés.
+    - Une valeur inconnue lève `ConfigError` (message clair pour l'utilisateur)."""
+    if not raw:
+        return DETAIL_LEVELS
+    seen: list[DetailLevel] = []
+    for token in raw.split(","):
+        item = token.strip()
+        if not item:
+            continue
+        if item not in DETAIL_LEVELS:
+            raise ConfigError(
+                f"--detail : « {item} » n'est pas un niveau valide "
+                f"(attendu : {', '.join(DETAIL_LEVELS)})"
+            )
+        if item not in seen:
+            # Le contrôle `item in DETAIL_LEVELS` ci-dessus a déjà rétréci le type.
+            seen.append(item)
+    return tuple(seen) or DETAIL_LEVELS
+
+
+def cmd_compare(
+    config: Config,
+    video_id: str,
+    channel: NotifyChannel | None = None,
+    detail: str | None = None,
+) -> int:
+    """Génère les niveaux demandés pour la même vidéo et envoie chacun sur le canal
     choisi (défaut : le canal de la playlist de la vidéo), avec un en-tête « [BREF] »,
     « [STANDARD] », « [DETAILLE] » en tête du texte. Ne touche PAS au statut de la vidéo
-    en base : le résumé de comparaison n'est jamais persisté."""
+    en base : le résumé de comparaison n'est jamais persisté. `detail` accepte une chaîne
+    séparée par virgules (par ex. « bref,detaille ») ; défaut = les trois niveaux."""
     from guetteur.pipeline import transcript_from_json
     from guetteur.summarize.base import SummarizeError, SummaryMeta
+
+    try:
+        levels = _parse_detail_filter(detail)
+    except ConfigError as exc:
+        print(f"❌ {exc}", file=sys.stderr)
+        return 2
 
     store = Store(config.db_path)
     try:
@@ -402,7 +439,7 @@ def cmd_compare(config: Config, video_id: str, channel: NotifyChannel | None = N
     summarizer = build_summarizer(config)
     notifier = build_notifier(target_channel, config)
     code = 0
-    for level in DETAIL_LEVELS:
+    for level in levels:
         header = f"[{level.upper()}]"
         print(f"→ génération {header}…")
         try:
@@ -535,6 +572,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     cp.add_argument("--video-id", required=True)
     cp.add_argument("--channel", choices=["telegram", "whatsapp"], default=None)
+    cp.add_argument(
+        "--detail",
+        default=None,
+        help=(
+            "restreint la comparaison à un ou plusieurs niveaux, séparés par virgules "
+            f"({', '.join(DETAIL_LEVELS)}). Défaut : les trois."
+        ),
+    )
     he = sub.add_parser("health", help="base OK et dernier cycle récent (code retour 1 si KO)")
     he.add_argument(
         "--alert", action="store_true", help="alerte Telegram si KO (au plus une par heure)"
@@ -585,7 +630,7 @@ def cli(argv: Sequence[str] | None = None) -> int:
             case "archive":
                 return cmd_archive(config, args.video_id, args.pending)
             case "compare":
-                return cmd_compare(config, args.video_id, args.channel)
+                return cmd_compare(config, args.video_id, args.channel, args.detail)
             case "test-notify":
                 return cmd_test_notify(config, args.channel)
             case "doctor":

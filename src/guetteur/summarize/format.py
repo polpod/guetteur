@@ -12,7 +12,12 @@ import re
 from guetteur.models import Summary, Video
 
 # https://core.telegram.org/bots/api#markdownv2-style
+# Caractères réservés MarkdownV2 (Telegram) : doivent être échappés partout dans le texte,
+# y compris les préfixes de ligne (`!`, `>`, `-`…). Le seul moyen d'écrire un `!` littéral
+# est `\!`. Le bug corrigé venait de préfixes littéraux `!` et `>` dans le rendu detaille.
+_MDV2_RESERVED = frozenset("_*[]()~`>#+-=|{}.!\\")
 _MDV2_SPECIAL = re.compile(r"([_*\[\]()~`>#+\-=|{}.!\\])")
+# Dans l'URL d'un lien [texte](url), seuls `)` et `\` doivent être échappés.
 _MDV2_URL_SPECIAL = re.compile(r"([)\\])")
 
 WORDS_PER_MINUTE = 200
@@ -25,11 +30,116 @@ SECTION_MARKER = "\x00SECTION\x00"
 
 
 def escape_markdown_v2(text: str) -> str:
+    """Échappe TOUS les caractères réservés MarkdownV2 (_ * [ ] ( ) ~ ` > # + - = | { } . !
+    et \\). C'est le seul chemin autorisé pour insérer du texte issu du modèle : tout
+    contournement (préfixe littéral `!`, `>`, `-`…) doit passer par ici."""
     return _MDV2_SPECIAL.sub(r"\\\1", text)
+
+
+# Alias explicite conforme au vocabulaire du lot correctif (« passer par une seule
+# fonction escape_md_v2 »). Même fonction, deux noms pour ne rien casser des usages.
+escape_md_v2 = escape_markdown_v2
 
 
 def escape_markdown_v2_url(url: str) -> str:
     return _MDV2_URL_SPECIAL.sub(r"\\\1", url)
+
+
+# --- validation d'un texte MarkdownV2 -----------------------------------------------------
+
+_TG_BYTE_OFFSET_RE = re.compile(r"byte offset (\d+)")
+
+
+def validate_markdown_v2(text: str) -> tuple[bool, int]:
+    """Simule l'analyseur MarkdownV2 de Telegram et retourne (valide, offset_faute).
+
+    Reconnaît trois balises utilisées par nos rendus : `*bold*`, `_italic_` et
+    `[text](url)`. À l'intérieur de `*..*` et `_.._`, les caractères réservés doivent
+    toujours être échappés — c'est aussi ainsi que Telegram parse le texte. Dans le
+    contenu du lien, tout caractère réservé doit être échappé ; dans son URL, seuls `)`
+    et `\\` doivent l'être.
+
+    Renvoyer (False, i) ne dit pas « Telegram va refuser à coup sûr » (l'analyseur
+    officiel est un peu plus permissif sur certaines combinaisons), mais un True fiable
+    garantit qu'aucun caractère réservé n'est laissé nu — c'est le contrat qui nous
+    intéresse pour ne plus envoyer une partie non parsable."""
+
+    def _text_valid(sub: str) -> tuple[bool, int]:
+        i = 0
+        n = len(sub)
+        while i < n:
+            c = sub[i]
+            if c == "\\":
+                # Un backslash consomme le caractère suivant, quel qu'il soit.
+                if i + 1 >= n:
+                    return False, i
+                i += 2
+                continue
+            if c == "*":
+                j = _find_unescaped(sub, i + 1, "*")
+                if j < 0:
+                    return False, i
+                ok, off = _text_valid(sub[i + 1 : j])
+                if not ok:
+                    return False, i + 1 + off
+                i = j + 1
+                continue
+            if c == "_":
+                j = _find_unescaped(sub, i + 1, "_")
+                if j < 0:
+                    return False, i
+                ok, off = _text_valid(sub[i + 1 : j])
+                if not ok:
+                    return False, i + 1 + off
+                i = j + 1
+                continue
+            if c == "[":
+                close_txt = _find_unescaped(sub, i + 1, "]")
+                if close_txt < 0 or close_txt + 1 >= n or sub[close_txt + 1] != "(":
+                    return False, i
+                close_url = _find_unescaped(sub, close_txt + 2, ")")
+                if close_url < 0:
+                    return False, i
+                ok, off = _text_valid(sub[i + 1 : close_txt])
+                if not ok:
+                    return False, i + 1 + off
+                # Dans l'URL, seuls ')' et '\\' doivent être échappés — le reste est libre.
+                # `_find_unescaped` a déjà validé la première ) non échappée : rien de plus
+                # à vérifier ici (les autres caractères sont autorisés dans l'URL).
+                i = close_url + 1
+                continue
+            if c in _MDV2_RESERVED:
+                return False, i
+            i += 1
+        return True, -1
+
+    return _text_valid(text)
+
+
+def _find_unescaped(text: str, start: int, target: str) -> int:
+    i = start
+    n = len(text)
+    while i < n:
+        if text[i] == "\\":
+            i += 2
+            continue
+        if text[i] == target:
+            return i
+        i += 1
+    return -1
+
+
+def telegram_byte_offset(error_message: str) -> int | None:
+    """Extrait « at byte offset N » d'une erreur Telegram, si présent."""
+    match = _TG_BYTE_OFFSET_RE.search(error_message)
+    return int(match.group(1)) if match else None
+
+
+def excerpt_around(text: str, offset: int, radius: int = 40) -> str:
+    """Extrait ~2*radius caractères autour de `offset` pour aider au diagnostic."""
+    start = max(0, offset - radius)
+    end = min(len(text), offset + radius)
+    return text[start:end]
 
 
 def timestamp_url(video_id: str, seconds: int) -> str:
@@ -180,17 +290,26 @@ def _render_md_v2_detailed(summary: Summary, video: Video, label: str) -> str:
         cite_lines = [SECTION_MARKER, "*Citations*"]
         for cit in summary.citations:
             link = escape_markdown_v2_url(timestamp_url(video.video_id, cit.seconds))
-            cite_lines.append(f"> [{e(format_timestamp(cit.seconds))}]({link}) _{e(cit.text)}_")
+            # `>` en début de ligne est réservé (blockquote MarkdownV2) — on l'échappe
+            # comme n'importe quel autre caractère de préfixe.
+            cite_lines.append(
+                f"{e('\u203a')} [{e(format_timestamp(cit.seconds))}]({link}) _{e(cit.text)}_"
+            )
         parts.append("\n".join(cite_lines))
     if summary.actions:
         action_lines = [SECTION_MARKER, "*À faire*"]
         for action in summary.actions:
-            action_lines.append(f"→ {e(action)}")
+            # `→` est un caractère unicode non réservé mais on le passe quand même par
+            # escape_md_v2 pour respecter la règle « tout texte du rendu passe par une
+            # seule fonction ». `e(...)` sur du texte non réservé est idempotent.
+            action_lines.append(f"{e('→')} {e(action)}")
         parts.append("\n".join(action_lines))
     if summary.reserves:
         reserve_lines = [SECTION_MARKER, "*Réserves*"]
         for reserve in summary.reserves:
-            reserve_lines.append(f"! {e(reserve)}")
+            # `!` est réservé : c'est le bug corrigé qui faisait planter la partie 3/3.
+            # Le préfixe passe désormais par escape_md_v2 comme tout le reste.
+            reserve_lines.append(f"{e('!')} {e(reserve)}")
         parts.append("\n".join(reserve_lines))
     parts.append(f"{SECTION_MARKER}{_footer_md_v2(summary)}")
     return "\n\n".join(parts)
