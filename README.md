@@ -491,7 +491,8 @@ nécessite `sqlite3`.
 | `retry --video-id X` / `retry --all` | Remet une vidéo `failed` (ou toutes) en file avec `retries = 0`. Elle reprend là où elle en était (`summarized` si le résumé existe : pas de rappel Claude). |
 | `reset --video-id X` | Retraitement complet : repasse en `new` et efface transcription, résumé et état d'envoi. Avertit si la vidéo avait déjà été envoyée. |
 | `health [--alert]` | Base OK et dernier cycle datant de moins de 3 intervalles. Code retour 1 si KO. `--alert` : alerte Telegram si KO, au plus une par heure (timer systemd). |
-| `doctor` | Tableau OK/KO : binaire `claude` trouvé et connecté (`claude -p "ping" --output-format json` doit répondre), ffmpeg, base SQLite, jetons des canaux utilisés (et `ANTHROPIC_API_KEY` si `provider = "claude_api"`). Code retour 1 si une ligne est KO. |
+| `archive --video-id X` / `archive --pending` | Archive une vidéo (ou toutes les `sent` sans `archived_at`) dans le notebook NotebookLM configuré. Voir [docs/notebooklm.md](docs/notebooklm.md). |
+| `doctor` | Tableau OK/KO : binaire `claude` trouvé et connecté (`claude -p "ping" --output-format json` doit répondre), ffmpeg, base SQLite, jetons des canaux utilisés (et `ANTHROPIC_API_KEY` si `provider = "claude_api"`), plus 4 lignes NotebookLM si `archive.enabled = true`. Code retour 1 si une ligne est KO. |
 | `test-notify [--channel …]` | Envoie un faux résumé (avec des caractères spéciaux) pour valider l'échappement et les liens. |
 | `auth [--port 8765] [--bind …]` | Autorisation OAuth pour les playlists privées. |
 
@@ -520,6 +521,7 @@ Option globale : `--config chemin/config.toml` (ou la variable `GUETTEUR_CONFIG`
 | `notify.max_attempts` | `3` | Tentatives par canal sur erreur passagère (5xx, 429, timeout). |
 | `notify.retry_delays_s` | `[2, 8, 30]` | Attente après la 1re, 2e, 3e tentative ratée (la dernière valeur sert au-delà). |
 | `notify.sending_timeout_min` | `10` | Une vidéo en `sending` depuis plus longtemps est reprise au cycle suivant. |
+| `archive.*` | *(désactivé)* | Archivage optionnel de la veille dans un notebook Google NotebookLM. Voir [docs/notebooklm.md](docs/notebooklm.md) pour les clés, la sécurité et l'installation. |
 | `whatsapp.*` | | Version de l'API Graph et modèle utilisé hors fenêtre de 24 h. |
 | `[[playlists]]` | | `id`, `label`, `language` (langue du résumé), `notify` (`telegram` ou `whatsapp`), `private`. |
 

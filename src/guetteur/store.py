@@ -27,7 +27,7 @@ from pathlib import Path
 
 from guetteur.models import Video
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class Status(StrEnum):
@@ -59,7 +59,8 @@ CREATE TABLE IF NOT EXISTS videos (
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL,
     sent_at         TEXT,
-    send_attempt_at TEXT
+    send_attempt_at TEXT,
+    archived_at     TEXT
 );
 """
 
@@ -126,10 +127,15 @@ class VideoRecord:
     updated_at: str
     sent_at: str | None
     send_attempt_at: str | None
+    archived_at: str | None = None
 
     @property
     def really_sent(self) -> bool:
         return self.status is Status.SENT and self.sent_at is not None
+
+    @property
+    def is_archived(self) -> bool:
+        return self.archived_at is not None
 
     def to_video(self) -> Video:
         published = datetime.fromisoformat(self.published_at) if self.published_at else None
@@ -173,18 +179,30 @@ class Store:
     def _migrate(self) -> None:
         """Lot 1 → Lot 2 : la contrainte CHECK du statut ne connaît pas « sending » et la
         colonne send_attempt_at manque. SQLite ne sait pas modifier une contrainte : on
-        reconstruit la table en conservant toutes les lignes."""
+        reconstruit la table en conservant toutes les lignes.
+        Lot 2 → Lot 3 : ajoute la colonne archived_at (nullable, ALTER TABLE suffit)."""
         row = self._conn.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'videos'"
         ).fetchone()
-        if row is None or "send_attempt_at" in str(row["sql"]):
-            return
-        with self._tx() as conn:
-            conn.execute("ALTER TABLE videos RENAME TO videos_v1")
-            conn.execute("DROP INDEX IF EXISTS idx_videos_status")
-            conn.execute(_VIDEOS_DDL)
-            conn.execute(f"INSERT INTO videos ({_V1_COLUMNS}) SELECT {_V1_COLUMNS} FROM videos_v1")
-            conn.execute("DROP TABLE videos_v1")
+        if row is None:
+            return  # base neuve : _SCHEMA crée tout
+        sql = str(row["sql"])
+        if "send_attempt_at" not in sql:
+            with self._tx() as conn:
+                conn.execute("ALTER TABLE videos RENAME TO videos_v1")
+                conn.execute("DROP INDEX IF EXISTS idx_videos_status")
+                conn.execute(_VIDEOS_DDL)
+                conn.execute(
+                    f"INSERT INTO videos ({_V1_COLUMNS}) SELECT {_V1_COLUMNS} FROM videos_v1"
+                )
+                conn.execute("DROP TABLE videos_v1")
+            sql = str(
+                self._conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'videos'"
+                ).fetchone()["sql"]
+            )
+        if "archived_at" not in sql:
+            self._conn.execute("ALTER TABLE videos ADD COLUMN archived_at TEXT")
 
     @contextmanager
     def _tx(self) -> Iterator[sqlite3.Connection]:
@@ -473,7 +491,29 @@ class Store:
             for r in rows
         ]
 
-    # --- meta (heartbeat, alertes) ---------------------------------------------------------
+    # --- archivage (Lot 3) -----------------------------------------------------------------
+
+    def mark_archived(self, video_id: str, now: datetime | None = None) -> bool:
+        """Marque une vidéo comme archivée dans NotebookLM (archived_at horodaté).
+        Ne modifie pas le statut de l'envoi ; seule la vidéo `sent` a un sens ici."""
+        stamp = _iso(now or utcnow())
+        cur = self._conn.execute(
+            "UPDATE videos SET archived_at = ?, updated_at = ? "
+            "WHERE video_id = ? AND status = ? AND archived_at IS NULL",
+            (stamp, stamp, video_id, Status.SENT.value),
+        )
+        return cur.rowcount == 1
+
+    def pending_archive(self, limit: int = 50) -> list[VideoRecord]:
+        """Vidéos réellement envoyées (sent + sent_at non NULL) mais pas encore archivées."""
+        rows = self._conn.execute(
+            "SELECT * FROM videos WHERE status = ? AND sent_at IS NOT NULL "
+            "AND archived_at IS NULL ORDER BY sent_at ASC LIMIT ?",
+            (Status.SENT.value, limit),
+        ).fetchall()
+        return [self._record(r) for r in rows]
+
+    # --- meta (heartbeat, alertes, archive) ------------------------------------------------
 
     def set_meta(self, key: str, value: str) -> None:
         self._conn.execute(
@@ -537,4 +577,5 @@ class Store:
             updated_at=row["updated_at"],
             sent_at=row["sent_at"],
             send_attempt_at=row["send_attempt_at"],
+            archived_at=row["archived_at"],
         )

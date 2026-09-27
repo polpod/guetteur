@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import sqlite3
 import subprocess
@@ -111,6 +112,120 @@ def check_secrets(config: Config) -> list[Check]:
     return checks
 
 
+def check_notebooklm(config: Config, store: Store | None = None) -> list[Check]:
+    """4 lignes attendues par l'utilisateur en Lot 3 : version épinglée, permissions
+    du home dédié, session (auth check), compte Google. Toutes gérées sans lever."""
+    from guetteur.archive.base import FORBIDDEN_ENV_VARS, ArchiveError
+
+    if not config.archive.enabled:
+        return [Check("notebooklm : archivage", True, "désactivé (archive.enabled = false)")]
+
+    checks: list[Check] = []
+
+    # 1. version
+    expected = config.archive.pinned_version
+    try:
+        from importlib.metadata import PackageNotFoundError, version
+
+        try:
+            got = version("notebooklm-py")
+            ok_v = got == expected
+            checks.append(
+                Check(
+                    "notebooklm : version",
+                    ok_v,
+                    f"{got} (attendu {expected})" if not ok_v else f"{got}",
+                )
+            )
+        except PackageNotFoundError:
+            checks.append(
+                Check(
+                    "notebooklm : version",
+                    False,
+                    f"notebooklm-py absent : uv sync --frozen --no-dev --extra notebooklm "
+                    f"(épinglage attendu : {expected})",
+                )
+            )
+            return checks
+    except ImportError:  # pragma: no cover
+        checks.append(Check("notebooklm : version", False, "importlib.metadata indisponible"))
+        return checks
+
+    # 2. permissions du home dédié
+    home = config.archive.home
+    if not home.exists():
+        checks.append(
+            Check(
+                "notebooklm : permissions home",
+                False,
+                f"{home} absent — sera créé au 1er démarrage (mkdir 0700)",
+            )
+        )
+    else:
+        mode = home.stat().st_mode & 0o777
+        details = [f"{home} (0{mode:o})"]
+        ok_perms = mode == 0o700
+        for filename in ("storage_state.json", "master_token.json"):
+            for p in home.rglob(filename):
+                m = p.stat().st_mode & 0o777
+                details.append(f"{p.name}=0{m:o}")
+                if m != 0o600:
+                    ok_perms = False
+        forbidden = sorted(v for v in FORBIDDEN_ENV_VARS if v in os.environ)
+        if forbidden:
+            ok_perms = False
+            details.append(f"env interdit : {','.join(forbidden)}")
+        checks.append(Check("notebooklm : permissions home", ok_perms, "; ".join(details)))
+
+    # 3. session — la vérification vit dans le client, on l'appelle pour de vrai
+    #    (l'échec attrape ArchiveError et donne le motif redacté).
+    account_email: str | None = None
+    try:
+        from guetteur.archive.notebooklm import NotebookLMArchiver
+
+        managed_store = store or Store(config.db_path)
+        close_after = store is None
+        try:
+            archiver = NotebookLMArchiver(config.archive, managed_store)
+            account_email = archiver.auth_check()
+        finally:
+            if close_after:
+                managed_store.close()
+        checks.append(
+            Check(
+                "notebooklm : session",
+                account_email is not None,
+                f"connecté ({account_email})" if account_email else "aucun email renvoyé",
+            )
+        )
+    except ArchiveError as exc:
+        checks.append(Check("notebooklm : session", False, str(exc)))
+        return checks
+    except Exception as exc:  # pragma: no cover
+        checks.append(Check("notebooklm : session", False, f"{type(exc).__name__}: {exc}"))
+        return checks
+
+    # 4. compte
+    expected_account = config.archive.account
+    if not expected_account:
+        checks.append(
+            Check(
+                "notebooklm : compte",
+                True,
+                f"aucun compte attendu (archive.account vide) — connecté : {account_email or '?'}",
+            )
+        )
+    else:
+        ok_a = account_email == expected_account
+        detail = (
+            f"{account_email} = {expected_account}"
+            if ok_a
+            else f"{account_email} ≠ {expected_account} (attendu)"
+        )
+        checks.append(Check("notebooklm : compte", ok_a, detail))
+    return checks
+
+
 def run_checks(
     config: Config, which: Which = shutil.which, claude: ClaudeCodeSummarizer | None = None
 ) -> list[Check]:
@@ -121,6 +236,7 @@ def run_checks(
     checks.append(check_ffmpeg(which))
     checks.append(check_database(config))
     checks += check_secrets(config)
+    checks += check_notebooklm(config)
     return checks
 
 

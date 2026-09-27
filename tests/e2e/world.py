@@ -10,6 +10,7 @@ from typing import Any, Literal
 
 import httpx
 
+from guetteur.archive.base import Archiver
 from guetteur.config import Config, NotifyChannel
 from guetteur.notify.base import Notifier
 from guetteur.notify.telegram import TelegramNotifier
@@ -38,6 +39,7 @@ class World:
         config: Config,
         backend: Backend,
         spawn: FakeSpawn | None = None,
+        archiver: Archiver | None = None,
     ) -> None:
         self.config = config
         self.backend = backend
@@ -76,6 +78,7 @@ class World:
             summarizer=summarizer,
             notifier_factory=self._notifier_for,
             sleep=self.sleeps.append,
+            archiver=archiver,
         )
 
     def _notifier_for(self, channel: NotifyChannel) -> Notifier:

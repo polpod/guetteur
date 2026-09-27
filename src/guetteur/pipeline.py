@@ -9,6 +9,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import timedelta
 
+from guetteur.archive.base import ArchiveError, Archiver, NoOpArchiver, redact
 from guetteur.config import Config, ConfigError, NotifyChannel, PlaylistConfig
 from guetteur.models import Segment, Summary, Transcript, Video
 from guetteur.notify.base import Message, Notifier, NotifyError
@@ -22,7 +23,12 @@ from guetteur.summarize.base import (
     summary_from_json,
     summary_to_json,
 )
-from guetteur.summarize.format import render_markdown_v2, render_no_transcript, render_plain
+from guetteur.summarize.format import (
+    render_markdown,
+    render_markdown_v2,
+    render_no_transcript,
+    render_plain,
+)
 from guetteur.transcript.base import NoTranscriptError, TranscriptError, TranscriptProvider
 
 log = logging.getLogger(__name__)
@@ -42,6 +48,7 @@ class CycleStats:
     failed: int = 0
     recovered: int = 0  # envois « sending » périmés repris en début de cycle
     skipped: int = 0  # backfill : vidéos déjà envoyées ou « failed » sans --force
+    archived: int = 0  # vidéos archivées avec succès dans NotebookLM
     aborted: str = ""  # raison si le cycle a été interrompu (backend de résumé indisponible)
 
 
@@ -84,6 +91,7 @@ class Pipeline:
         summarizer: Summarizer,
         notifier_factory: NotifierFactory,
         sleep: Callable[[float], None] = time.sleep,
+        archiver: Archiver | None = None,
     ) -> None:
         self._config = config
         self._store = store
@@ -93,6 +101,7 @@ class Pipeline:
         self._notifier_factory = notifier_factory
         self._notifiers: dict[NotifyChannel, Notifier] = {}
         self._sleep = sleep
+        self._archiver: Archiver = archiver or NoOpArchiver()
 
     # --- découverte ------------------------------------------------------------------------
 
@@ -199,6 +208,9 @@ class Pipeline:
             outcome = self._retry_or_fail(record, f"{type(exc).__name__}: {exc}", notify=False)
         if outcome == "sent":
             stats.sent += 1
+            latest = self._store.get(record.video_id)
+            if latest is not None and latest.is_archived:
+                stats.archived += 1
         elif outcome == "failed":
             stats.failed += 1
 
@@ -248,7 +260,9 @@ class Pipeline:
             state = current.status.value if current else "inconnue"
             log.warning("video.not_claimable", extra={**ctx, "status": state})
             return "skipped"
-        return self._deliver(vid, playlist, build_message(summary, video, playlist.label))
+        return self._deliver(
+            vid, playlist, video, summary, build_message(summary, video, playlist.label)
+        )
 
     # --- envoi -----------------------------------------------------------------------------
 
@@ -266,7 +280,14 @@ class Pipeline:
             channels.append((fallback, True))
         return channels
 
-    def _deliver(self, vid: str, playlist: PlaylistConfig, message: Message) -> str:
+    def _deliver(
+        self,
+        vid: str,
+        playlist: PlaylistConfig,
+        video: Video,
+        summary: Summary,
+        message: Message,
+    ) -> str:
         """Envoie une vidéo déjà réclamée (« sending ») : tentatives avec attente croissante
         sur erreur passagère, puis canal de secours après un échec définitif du principal.
         Chaque tentative est tracée dans deliveries."""
@@ -307,6 +328,7 @@ class Pipeline:
                 )
                 self._store.mark_sent(vid)
                 log.info("video.sent", extra={**ctx, "attempt": attempt})
+                self._maybe_archive(vid, video, summary, playlist.label)
                 return "sent"
             if last is not None:
                 kind = "passagère" if last.retryable else "définitive"
@@ -342,6 +364,38 @@ class Pipeline:
             if notify:
                 self._notify_no_transcript(record)
         return "failed"
+
+    # --- archivage (Lot 3) -----------------------------------------------------------------
+
+    def _maybe_archive(self, vid: str, video: Video, summary: Summary, label: str) -> None:
+        """Après un envoi réussi : ajoute la vidéo au notebook NotebookLM. Non bloquant :
+        toute erreur reste en warning, archived_at reste NULL, la vidéo est déjà « sent »."""
+        if not self._archiver.enabled:
+            return
+        try:
+            body = render_markdown(summary, video, label)
+            outcome = self._archiver.archive(video, body)
+        except ArchiveError as exc:
+            log.warning(
+                "video.archive_failed",
+                extra={"video_id": vid, "retryable": exc.retryable, "error": redact(str(exc))},
+            )
+            return
+        except Exception as exc:  # défense en profondeur : jamais bloquant
+            log.warning(
+                "video.archive_failed",
+                extra={"video_id": vid, "error": redact(f"{type(exc).__name__}: {exc}")},
+            )
+            return
+        self._store.mark_archived(vid)
+        log.info(
+            "video.archived",
+            extra={
+                "video_id": vid,
+                "notebook_id": outcome.notebook_id,
+                "note_id": outcome.note_id,
+            },
+        )
 
     def _notify_no_transcript(self, record: VideoRecord) -> None:
         playlist = self._playlist_for(record)

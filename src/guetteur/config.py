@@ -58,6 +58,29 @@ class NotifyConfig:
     sending_timeout_min: int = 10
 
 
+def _default_archive_home() -> Path:
+    """Emplacement dédié pour NOTEBOOKLM_HOME (audit §8.4).
+
+    - En production LXC (`/opt/guetteur` existe) : `/opt/guetteur/data/nlm`.
+    - Sinon (dev / tests) : `~/.guetteur-nlm` — jamais `~` ni un dossier partagé
+      qui risquerait d'être en 0755 ou de contenir d'autres données."""
+    if Path("/opt/guetteur").is_dir():
+        return Path("/opt/guetteur/data/nlm")
+    return Path.home() / ".guetteur-nlm"
+
+
+@dataclass(frozen=True)
+class ArchiveConfig:
+    # Archivage de la veille dans Google NotebookLM (extra optionnel notebooklm).
+    enabled: bool = False
+    notebook_name: str = "Veille YouTube"
+    account: str = ""  # compte Google dédié attendu (guetteur doctor vérifie l'égalité)
+    home: Path = field(default_factory=_default_archive_home)
+    max_sources_per_notebook: int = 45
+    # Version épinglée dans l'extra, vérifiée par doctor (voir audit §9).
+    pinned_version: str = "0.8.3"
+
+
 @dataclass(frozen=True)
 class WhatsAppConfig:
     api_version: str = "v20.0"
@@ -100,6 +123,7 @@ class Config:
     summarize: SummarizeConfig = field(default_factory=SummarizeConfig)
     notify: NotifyConfig = field(default_factory=NotifyConfig)
     whatsapp: WhatsAppConfig = field(default_factory=WhatsAppConfig)
+    archive: ArchiveConfig = field(default_factory=ArchiveConfig)
     secrets: Secrets = field(default_factory=Secrets)
 
     @property
@@ -183,7 +207,31 @@ def _parse_notify(raw: dict[str, Any]) -> NotifyConfig:
     )
 
 
-_SECTIONS = frozenset({"general", "transcript", "summarize", "notify", "whatsapp", "playlists"})
+def _parse_archive(raw: dict[str, Any]) -> ArchiveConfig:
+    default = ArchiveConfig()
+    home_raw = raw.get("home")
+    home = Path(str(home_raw)) if home_raw else default.home
+    if home.is_absolute() is False and str(home) not in ("", "."):
+        # Un chemin relatif serait résolu depuis le cwd du service — ambigu.
+        raise ConfigError(f"archive.home doit être un chemin absolu (reçu : {home!r})")
+    account = str(raw.get("account", ""))
+    pinned = str(raw.get("pinned_version", default.pinned_version))
+    return ArchiveConfig(
+        enabled=bool(raw.get("enabled", False)),
+        notebook_name=str(raw.get("notebook_name", default.notebook_name)),
+        account=account,
+        home=home,
+        max_sources_per_notebook=_positive_int(
+            raw.get("max_sources_per_notebook", default.max_sources_per_notebook),
+            "archive.max_sources_per_notebook",
+        ),
+        pinned_version=pinned,
+    )
+
+
+_SECTIONS = frozenset(
+    {"general", "transcript", "summarize", "notify", "whatsapp", "archive", "playlists"}
+)
 
 
 def parse_config(data: dict[str, Any], secrets: Secrets | None = None) -> Config:
@@ -225,6 +273,7 @@ def parse_config(data: dict[str, Any], secrets: Secrets | None = None) -> Config
             template_language=str(wa.get("template_language", "en_US")),
             template_body_param=bool(wa.get("template_body_param", False)),
         ),
+        archive=_parse_archive(data.get("archive", {})),
         secrets=secrets if secrets is not None else Secrets.from_env(),
     )
 

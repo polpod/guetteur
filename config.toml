@@ -26,6 +26,21 @@ max_attempts = 3                  # tentatives par canal sur erreur passagère (
 retry_delays_s = [2, 8, 30]       # attente après la 1re, 2e, 3e tentative ratée
 sending_timeout_min = 10          # un envoi « sending » plus ancien est repris au cycle suivant
 
+[archive]
+# Archivage optionnel de la veille dans Google NotebookLM (extra `notebooklm`).
+# Voir docs/audit-notebooklm/RAPPORT.md §8 pour les conditions de sécurité.
+enabled = false
+notebook_name = "Veille YouTube"
+# Compte Google dédié attendu (guetteur doctor vérifie l'égalité avec l'API).
+account = ""
+# NOTEBOOKLM_HOME dédié : refus de démarrer si ce n'est pas en 0700.
+# Défaut : /opt/guetteur/data/nlm en prod (LXC), ~/.guetteur-nlm en dev.
+# home = "/opt/guetteur/data/nlm"
+# Rotation automatique du notebook au-delà de ce nombre de sources.
+max_sources_per_notebook = 45
+# Version épinglée dans pyproject.toml (extra notebooklm) et vérifiée par doctor.
+pinned_version = "0.8.3"
+
 [whatsapp]
 api_version = "v20.0"
 # Modèle (template) envoyé si la fenêtre de 24 h est fermée. « hello_world » existe par défaut

@@ -20,6 +20,11 @@ dependencies = [
 whisper = [
     "faster-whisper>=1.2.1",
 ]
+# NotebookLM : version audit-fixée (voir docs/audit-notebooklm/RAPPORT.md §8-9).
+# Aucun autre extra de notebooklm-py : jamais [cookies], [browser], [android], [mcp], [server].
+notebooklm = [
+    "notebooklm-py==0.8.3",
+]
 
 [build-system]
 requires = ["hatchling"]
@@ -43,6 +48,7 @@ guetteur = "guetteur.main:cli"
 line-length = 100
 target-version = "py312"
 src = ["src", "tests"]
+extend-exclude = ["docs"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF", "N", "C4", "PTH", "RET"]
@@ -54,7 +60,13 @@ mypy_path = "src"
 files = ["src", "tests"]
 
 [[tool.mypy.overrides]]
-module = ["feedparser.*", "yt_dlp.*", "faster_whisper.*", "google_auth_oauthlib.*"]
+module = [
+    "feedparser.*",
+    "yt_dlp.*",
+    "faster_whisper.*",
+    "google_auth_oauthlib.*",
+    "notebooklm.*",
+]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

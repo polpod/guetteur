@@ -7,7 +7,8 @@
 # que s'il manque, le dépôt est mis à jour s'il est déjà cloné.
 #
 # Variables facultatives : REPO_URL (sinon git@github.com:polpod/guetteur.git, puis HTTPS),
-# INSTALL_DIR (/opt/guetteur), SERVICE_USER (guetteur), WITH_WHISPER=1, UPDATE_CLAUDE=1.
+# INSTALL_DIR (/opt/guetteur), SERVICE_USER (guetteur), WITH_WHISPER=1, WITH_NOTEBOOKLM=1,
+# UPDATE_CLAUDE=1.
 set -euo pipefail
 
 INSTALL_DIR="${INSTALL_DIR:-/opt/guetteur}"
@@ -16,8 +17,18 @@ REPO_SSH="git@github.com:polpod/guetteur.git"
 REPO_HTTPS="https://github.com/polpod/guetteur.git"
 REPO_URL="${REPO_URL:-}"
 WITH_WHISPER="${WITH_WHISPER:-0}"
+WITH_NOTEBOOKLM="${WITH_NOTEBOOKLM:-1}" # extra epinglé, audité (voir audit §8-9)
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-UNITS=(guetteur.service guetteur-health.service guetteur-health.timer)
+UNITS=(
+    guetteur.service
+    guetteur-health.service
+    guetteur-health.timer
+    guetteur-nlm-refresh.service
+    guetteur-nlm-refresh.timer
+)
+# Wheel notebooklm-py 0.8.3, sha256 audité (voir audit-notebooklm/RAPPORT.md §9).
+NLM_VERSION="0.8.3"
+NLM_HASH="sha256:7e3e02057b3acf354d3dbc337c08869d2a4954c9c324f3271e272236cfcc2bfc"
 
 log() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 ok() { printf '    \033[32m✓\033[0m %s\n' "$*"; }
@@ -120,10 +131,36 @@ chmod -R go-w "$INSTALL_DIR" # une copie depuis NTFS arrive en 777
 
 log "Python 3.12 et dépendances (uv sync --no-dev)"
 extra=()
-[[ "$WITH_WHISPER" == "1" ]] && extra=(--extra whisper)
+[[ "$WITH_WHISPER" == "1" ]] && extra+=(--extra whisper)
+[[ "$WITH_NOTEBOOKLM" == "1" ]] && extra+=(--extra notebooklm)
 sudo -u "$SERVICE_USER" -H bash -c 'cd "$1" && shift && uv python install 3.12 \
     && uv sync --frozen --no-dev --python 3.12 "$@"' _ "$INSTALL_DIR" "${extra[@]}"
 ok "environnement prêt ($INSTALL_DIR/.venv)"
+
+if [[ "$WITH_NOTEBOOKLM" == "1" ]]; then
+    log "notebooklm-py $NLM_VERSION (uv tool, wheel épinglé par hash, sans extra)"
+    # Contraintes uv : version + hash sha256 audité. Wheel seulement (--no-sources
+    # empêche toute source-dist qui exécuterait le hook de build).
+    nlm_constraints="$(mktemp)"
+    trap 'rm -f "$nlm_constraints"' EXIT
+    cat >"$nlm_constraints" <<EOF
+notebooklm-py==${NLM_VERSION} --hash=${NLM_HASH}
+EOF
+    # `uv tool install` crée /root/.local/share/uv/tools/notebooklm-py/ et un
+    # entrypoint dans /root/.local/bin ; on symlink dans /usr/local/bin pour le
+    # service systemd (User=guetteur n'a pas /root/.local/bin dans le PATH).
+    if ! /usr/local/bin/uv tool install --force --constraints "$nlm_constraints" \
+        "notebooklm-py==${NLM_VERSION}" >/dev/null; then
+        die "installation de notebooklm-py $NLM_VERSION en échec (hash sha256 ?)."
+    fi
+    nlm_bin="$(/usr/local/bin/uv tool dir)/notebooklm-py/bin/notebooklm"
+    [[ -x "$nlm_bin" ]] || die "notebooklm introuvable après uv tool install ($nlm_bin)"
+    ln -sf "$nlm_bin" /usr/local/bin/notebooklm
+    ok "$(/usr/local/bin/notebooklm --version 2>&1 | head -1)"
+    # NOTEBOOKLM_HOME dédié, 0700, possédé par guetteur.
+    install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0700 "$INSTALL_DIR/data/nlm"
+    ok "$INSTALL_DIR/data/nlm (0700, $SERVICE_USER)"
+fi
 
 log "Commande « guetteur » (/usr/local/bin/guetteur)"
 cat >/usr/local/bin/guetteur <<WRAPPER
@@ -161,6 +198,18 @@ else
     # Désactivé tant que .env et la session Claude ne sont pas en place.
     systemctl disable guetteur.service guetteur-health.timer >/dev/null 2>&1 || true
     ok "unités installées, désactivées (.env : $env_ready, session claude : $session_ready)"
+fi
+# Le refresh NotebookLM ne démarre que quand un master_token.json ou un
+# storage_state.json existe déjà dans le home dédié (poussés depuis WSL).
+if [[ "$WITH_NOTEBOOKLM" == "1" ]] && \
+    [[ -s "$INSTALL_DIR/data/nlm/master_token.json" \
+        || -s "$INSTALL_DIR/data/nlm/storage_state.json" ]]; then
+    systemctl enable guetteur-nlm-refresh.timer >/dev/null
+    systemctl start guetteur-nlm-refresh.timer
+    ok "refresh NotebookLM activé (toutes les 6 h)"
+else
+    systemctl disable guetteur-nlm-refresh.timer >/dev/null 2>&1 || true
+    ok "refresh NotebookLM en attente (poussez le profil depuis WSL — voir README)"
 fi
 
 cat <<NEXT

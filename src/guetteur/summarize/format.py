@@ -76,6 +76,26 @@ def render_plain(summary: Summary, video: Video, label: str = "") -> str:
     return "\n".join(lines)
 
 
+def render_markdown(summary: Summary, video: Video, label: str = "") -> str:
+    """Résumé en Markdown brut (non échappé), utilisé pour l'archivage NotebookLM."""
+    header_meta = " · ".join(x for x in (video.channel, label) if x)
+    lines = [f"# {summary.title}"]
+    if header_meta:
+        lines.append(f"_{header_meta}_")
+    lines += ["", f"**TL;DR** — {summary.tldr}", "", "## Points clés", ""]
+    for kp in summary.key_points:
+        stamp = format_timestamp(kp.seconds)
+        link = timestamp_url(video.video_id, kp.seconds)
+        lines.append(f"- [{stamp}]({link}) — {kp.text}")
+    lines += [
+        "",
+        f"**Pourquoi ça compte** — {summary.why_it_matters}",
+        "",
+        f"_⏱ Lecture : {summary.reading_time_minutes} min_",
+    ]
+    return "\n".join(lines)
+
+
 def render_no_transcript(video: Video, markdown_v2: bool) -> str:
     text = f"⚠️ Pas de transcription disponible pour « {video.title} » — vidéo abandonnée."
     if markdown_v2:

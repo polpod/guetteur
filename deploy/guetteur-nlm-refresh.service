@@ -1,0 +1,29 @@
+# /etc/systemd/system/guetteur-nlm-refresh.service — refresh Google/NotebookLM
+# Lancé toutes les 6 h par guetteur-nlm-refresh.timer sous l'utilisateur guetteur.
+# Utilise le binaire `notebooklm` installé par uv tool (voir install-lxc.sh) qui
+# est lu-seul depuis /root/.local/share/uv/tools ; les cookies vivent dans
+# NOTEBOOKLM_HOME (dossier dédié, 0700, jamais ~).
+[Unit]
+Description=GUETTEUR - refresh cookies NotebookLM (toutes les 6 h)
+ConditionPathIsDirectory=/opt/guetteur/data/nlm
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=guetteur
+Group=guetteur
+WorkingDirectory=/opt/guetteur
+Environment=NOTEBOOKLM_HOME=/opt/guetteur/data/nlm
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# --quiet limite la sortie ; le service échoue silencieusement si les cookies sont
+# perdus (l'admin doit alors refaire un login WSL et pousser le master token).
+ExecStart=/usr/local/bin/notebooklm auth refresh --quiet
+# Durcissement : jamais d'écriture ailleurs que dans le home dédié.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/guetteur/data/nlm
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectControlGroups=true

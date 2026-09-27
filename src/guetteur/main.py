@@ -1,5 +1,5 @@
 """Point d'entrée CLI : guetteur run | once | backfill | status | retry | reset | health |
-test-notify | doctor | auth."""
+archive | test-notify | doctor | auth."""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ from types import FrameType
 import schedule
 from dotenv import load_dotenv
 
+from guetteur.archive.base import Archiver, NoOpArchiver
 from guetteur.config import Config, ConfigError, NotifyChannel, PlaylistConfig, load_config
 from guetteur.logs import setup_logging
 from guetteur.models import KeyPoint, Summary, Video
@@ -25,6 +26,16 @@ from guetteur.sources.base import SourceError, VideoSource
 from guetteur.store import Status, Store
 
 log = logging.getLogger("guetteur")
+
+
+def build_archiver(config: Config, store: Store) -> Archiver:
+    """Renvoie un archiveur NotebookLM si `archive.enabled = true`, sinon un no-op.
+    L'import de notebooklm-py reste paresseux : rien n'est chargé si l'archivage est off."""
+    if not config.archive.enabled:
+        return NoOpArchiver()
+    from guetteur.archive.notebooklm import NotebookLMArchiver
+
+    return NotebookLMArchiver(config.archive, store)
 
 
 def build_pipeline(config: Config, store: Store) -> Pipeline:
@@ -59,6 +70,7 @@ def build_pipeline(config: Config, store: Store) -> Pipeline:
         transcriber=Transcriber(config.transcript.languages, whisper=whisper),
         summarizer=summarizer,
         notifier_factory=lambda channel: build_notifier(channel, config),
+        archiver=build_archiver(config, store),
     )
 
 
@@ -131,6 +143,7 @@ def cmd_status(config: Config, limit: int, status: str | None) -> int:
     finally:
         store.close()
     labels = {p.id: p.label for p in config.playlists}
+    archive_enabled = config.archive.enabled
     rows = [
         [
             r.video_id,
@@ -138,13 +151,17 @@ def cmd_status(config: Config, limit: int, status: str | None) -> int:
             truncate(labels.get(r.playlist_id, r.playlist_id), 20),
             r.status.value if r.status is not Status.SENT or r.sent_at else "sent (ignorée)",
             str(r.retries),
+            _archive_label(r.is_archived, r.really_sent, archive_enabled),
             truncate(r.last_error, 70),
         ]
         for r in records
     ]
     if rows:
         print(
-            render_rows(["id", "titre", "playlist", "statut", "retries", "dernière erreur"], rows)
+            render_rows(
+                ["id", "titre", "playlist", "statut", "retries", "archive", "dernière erreur"],
+                rows,
+            )
         )
     else:
         print("Aucune vidéo.")
@@ -152,6 +169,14 @@ def cmd_status(config: Config, limit: int, status: str | None) -> int:
     print(f"\nTotal : {summary}")
     print(f"Dernier cycle : {beat.isoformat(timespec='seconds') if beat else 'jamais'}")
     return 0
+
+
+def _archive_label(is_archived: bool, really_sent: bool, enabled: bool) -> str:
+    if is_archived:
+        return "oui"
+    if not enabled:
+        return "—"
+    return "non" if really_sent else "—"
 
 
 def cmd_retry(config: Config, video_id: str | None) -> int:
@@ -191,6 +216,90 @@ def cmd_reset(config: Config, video_id: str) -> int:
     if before.really_sent:
         print("⚠️  Cette vidéo avait déjà été envoyée : elle le sera une seconde fois.")
     return 0
+
+
+def cmd_archive(config: Config, video_id: str | None, pending: bool) -> int:
+    """`guetteur archive` : archive une vidéo dans NotebookLM ou rattrape le retard.
+
+    - `--video-id X` : archive une vidéo précise, doit être « sent » et non déjà archivée.
+    - `--pending`    : archive toutes les vidéos `sent` sans archived_at (par sent_at asc).
+
+    Retour 0 si tout est archivé, 1 si au moins une échoue. L'échec d'une vidéo ne bloque
+    pas les suivantes ; la raison est loggée avec redaction et archived_at reste NULL."""
+    from guetteur.archive.base import ArchiveError
+    from guetteur.summarize.base import summary_from_json
+    from guetteur.summarize.format import render_markdown
+
+    if not config.archive.enabled:
+        print("❌ archive.enabled = false dans config.toml", file=sys.stderr)
+        return 1
+
+    labels = {p.id: p.label for p in config.playlists}
+
+    store = Store(config.db_path)
+    try:
+        if video_id is not None:
+            record = store.get(video_id)
+            if record is None:
+                print(f"❌ Vidéo inconnue : {video_id}", file=sys.stderr)
+                return 1
+            if not record.really_sent:
+                print(f"→ {video_id} n'est pas « sent » (statut : {record.status.value}).")
+                return 1
+            if record.is_archived:
+                print(f"→ {video_id} est déjà archivée ({record.archived_at}).")
+                return 0
+            records = [record]
+        elif pending:
+            records = store.pending_archive(limit=1000)
+            if not records:
+                print("→ Aucune vidéo « sent » sans archive en attente.")
+                return 0
+        else:
+            print("❌ précisez --video-id ou --pending", file=sys.stderr)
+            return 2
+
+        archiver = build_archiver(config, store)
+        successes = 0
+        failures = 0
+        for rec in records:
+            video = rec.to_video()
+            summary_json = rec.summary
+            if summary_json is None:
+                print(f"⚠️  {rec.video_id} : résumé absent, ignorée", file=sys.stderr)
+                failures += 1
+                continue
+            try:
+                summary = summary_from_json(summary_json)
+                body = render_markdown(summary, video, labels.get(rec.playlist_id, ""))
+                outcome = archiver.archive(video, body)
+            except ArchiveError as exc:
+                print(f"❌ {rec.video_id} : {exc}", file=sys.stderr)
+                log.error(
+                    "archive.cli_failed",
+                    extra={
+                        "video_id": rec.video_id,
+                        "retryable": exc.retryable,
+                        "error": str(exc),
+                    },
+                )
+                failures += 1
+                continue
+            store.mark_archived(rec.video_id)
+            print(f"✅ {rec.video_id} → note {outcome.note_id}")
+            log.info(
+                "archive.cli_ok",
+                extra={
+                    "video_id": rec.video_id,
+                    "notebook_id": outcome.notebook_id,
+                    "note_id": outcome.note_id,
+                },
+            )
+            successes += 1
+        print(f"\nTotal : {successes} archivée(s), {failures} en échec")
+        return 0 if failures == 0 else 1
+    finally:
+        store.close()
 
 
 def cmd_health(config: Config, alert: bool) -> int:
@@ -309,6 +418,14 @@ def build_parser() -> argparse.ArgumentParser:
     he.add_argument(
         "--alert", action="store_true", help="alerte Telegram si KO (au plus une par heure)"
     )
+    ar = sub.add_parser(
+        "archive", help="archive une vidéo (ou toutes les « pending ») dans NotebookLM"
+    )
+    ar_target = ar.add_mutually_exclusive_group(required=True)
+    ar_target.add_argument("--video-id", help="une vidéo précise (doit être « sent »)")
+    ar_target.add_argument(
+        "--pending", action="store_true", help="toutes les vidéos « sent » sans archived_at"
+    )
     tn = sub.add_parser("test-notify", help="envoie un message de test")
     tn.add_argument("--channel", choices=["telegram", "whatsapp"], default=None)
     sub.add_parser("doctor", help="vérifie claude, ffmpeg, la base et les jetons")
@@ -344,6 +461,8 @@ def cli(argv: Sequence[str] | None = None) -> int:
                 return cmd_reset(config, args.video_id)
             case "health":
                 return cmd_health(config, args.alert)
+            case "archive":
+                return cmd_archive(config, args.video_id, args.pending)
             case "test-notify":
                 return cmd_test_notify(config, args.channel)
             case "doctor":
