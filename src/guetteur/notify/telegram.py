@@ -86,29 +86,33 @@ class TelegramNotifier(Notifier):
         message_id = (data.get("result") or {}).get("message_id")
         return str(message_id) if message_id is not None else None
 
-    def _post_markdown(self, text: str) -> str | None:
-        return self._post(
-            {
-                "chat_id": self._chat_id,
-                "text": text,
-                "parse_mode": "MarkdownV2",
-                "link_preview_options": {"is_disabled": True},
-            }
-        )
+    def _post_markdown(self, text: str, reply_markup: dict[str, Any] | None = None) -> str | None:
+        payload: dict[str, Any] = {
+            "chat_id": self._chat_id,
+            "text": text,
+            "parse_mode": "MarkdownV2",
+            "link_preview_options": {"is_disabled": True},
+        }
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
+        return self._post(payload)
 
-    def _post_plain(self, text: str) -> str | None:
+    def _post_plain(self, text: str, reply_markup: dict[str, Any] | None = None) -> str | None:
         """Envoi texte brut : pas de parse_mode. Les caractères réservés MarkdownV2 sont
         laissés tels quels — Telegram ne les interprète plus."""
-        return self._post(
-            {
-                "chat_id": self._chat_id,
-                "text": text,
-                "link_preview_options": {"is_disabled": True},
-            }
-        )
+        payload: dict[str, Any] = {
+            "chat_id": self._chat_id,
+            "text": text,
+            "link_preview_options": {"is_disabled": True},
+        }
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
+        return self._post(payload)
 
     def send(self, message: Message) -> str | None:
         md_parts, plain_parts = self._select_parts(message)
+        # `reply_markup` (boutons inline Lot 5) : uniquement sur la dernière part.
+        reply_markup = message.reply_markup
         # Pré-validation : si UNE partie n'est pas parsable, tout bascule en texte brut.
         invalid_index = self._find_invalid_part(md_parts)
         if invalid_index is not None:
@@ -120,12 +124,13 @@ class TelegramNotifier(Notifier):
                     "total": len(md_parts),
                 },
             )
-            return self._send_all_plain(plain_parts)
+            return self._send_all_plain(plain_parts, reply_markup)
         # Envoi MarkdownV2 avec fallback à la volée si Telegram rejette une part.
         ids: list[str] = []
         for i, part in enumerate(md_parts):
+            markup = reply_markup if i == len(md_parts) - 1 else None
             try:
-                message_id = self._post_markdown(part)
+                message_id = self._post_markdown(part, reply_markup=markup)
             except NotifyError as exc:
                 if not _is_parse_entities_error(exc):
                     raise
@@ -146,7 +151,7 @@ class TelegramNotifier(Notifier):
                     },
                 )
                 plain_tail = plain_parts[i:] if i < len(plain_parts) else [part]
-                tail_ids = self._send_plain_sequence(plain_tail)
+                tail_ids = self._send_plain_sequence(plain_tail, reply_markup=reply_markup)
                 ids.extend(tail_ids)
                 log.info(
                     "telegram.sent",
@@ -193,17 +198,27 @@ class TelegramNotifier(Notifier):
                 return i
         return None
 
-    def _send_all_plain(self, plain_parts: list[str]) -> str | None:
-        ids = self._send_plain_sequence(plain_parts)
+    def _send_all_plain(
+        self, plain_parts: list[str], reply_markup: dict[str, Any] | None = None
+    ) -> str | None:
+        ids = self._send_plain_sequence(plain_parts, reply_markup=reply_markup)
         log.info("telegram.sent", extra={"parts": len(plain_parts), "parse_mode": "plain"})
         return ",".join(ids) or None
 
-    def _send_plain_sequence(self, plain_parts: list[str]) -> list[str]:
+    def _send_plain_sequence(
+        self, plain_parts: list[str], reply_markup: dict[str, Any] | None = None
+    ) -> list[str]:
         ids: list[str] = []
-        for part in plain_parts:
+        # Le clavier inline va sur la dernière part non vide seulement.
+        last_nonempty = -1
+        for idx, part in enumerate(plain_parts):
+            if part:
+                last_nonempty = idx
+        for i, part in enumerate(plain_parts):
             if not part:
                 continue
-            message_id = self._post_plain(part)
+            markup = reply_markup if (reply_markup is not None and i == last_nonempty) else None
+            message_id = self._post_plain(part, reply_markup=markup)
             if message_id:
                 ids.append(message_id)
         return ids

@@ -80,6 +80,9 @@ def _config_file(tmp_path: Path, interval: int = 300) -> Path:
     path = tmp_path / "config.toml"
     path.write_text(
         f'[general]\ndata_dir = "{tmp_path.as_posix()}"\npoll_interval_seconds = {interval}\n\n'
+        # Bot Telegram désactivé pour ce test : sinon health.check_health ajoute une
+        # ligne « bot telegram : aucun getUpdates enregistré » qui casse l'assertion.
+        "[telegram]\ninteractive = false\n\n"
         '[[playlists]]\nid = "PL"\nlabel = "Veille IA"\n',
         encoding="utf-8",
     )

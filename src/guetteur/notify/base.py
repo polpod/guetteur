@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from typing import Any
 
 
 class NotifyError(RuntimeError):
@@ -38,7 +39,10 @@ class Message:
     Le Lot 4 permet de fournir directement les parts pré-découpées (résumés détaillés qui
     dépassent la limite Telegram et doivent être coupés aux frontières de section, avec
     numérotation « (i/N) »). Si `markdown_v2_parts` / `plain_parts` sont non vides, chaque
-    canal les envoie tels quels — sinon on retombe sur le découpage automatique."""
+    canal les envoie tels quels — sinon on retombe sur le découpage automatique.
+
+    Le Lot 5 permet d'attacher un `reply_markup` (clavier inline Telegram). Il est envoyé
+    UNIQUEMENT sur le dernier message (les boutons apparaissent sous le résumé complet)."""
 
     markdown_v2: str
     plain: str
@@ -47,6 +51,9 @@ class Message:
     # Parts pré-découpées avec numérotation ; longueur == nombre de messages à envoyer.
     markdown_v2_parts: tuple[str, ...] = ()
     plain_parts: tuple[str, ...] = ()
+    # Clavier inline Telegram (payload sendMessage.reply_markup). Placé sur la dernière
+    # part uniquement. Les autres canaux l'ignorent.
+    reply_markup: dict[str, Any] | None = None
 
 
 class Notifier(ABC):

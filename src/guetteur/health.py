@@ -20,6 +20,8 @@ log = logging.getLogger(__name__)
 HEARTBEAT_FACTOR = 3  # KO si aucun cycle depuis 3 fois poll_interval_seconds
 ALERT_EVERY = timedelta(hours=1)
 LAST_ALERT_KEY = "last_health_alert"
+# Le bot Telegram (Lot 5) doit avoir fait un getUpdates dans les 3 dernières minutes.
+BOT_HEARTBEAT_LIMIT = timedelta(minutes=3)
 
 
 @dataclass(frozen=True)
@@ -60,6 +62,27 @@ def check_health(config: Config, store: Store, now: datetime | None = None) -> l
         ok = age < limit
         detail = f"dernier cycle il y a {_age(age)} (seuil {_age(limit)})"
         checks.append(HealthCheck("heartbeat", ok, detail))
+
+    # Bot Telegram : vérifié seulement s'il est censé tourner (interactive=true ET jetons
+    # présents). Sinon aucune ligne — l'absence de bot n'est pas une erreur.
+    if config.telegram.interactive and config.secrets.telegram_bot_token:
+        from guetteur.notify.telegram_bot import META_HEARTBEAT
+
+        raw = store.get_meta(META_HEARTBEAT)
+        if raw is None:
+            checks.append(HealthCheck("bot telegram", False, "aucun getUpdates enregistré"))
+        else:
+            try:
+                bot_beat = datetime.fromisoformat(raw)
+            except ValueError:
+                checks.append(HealthCheck("bot telegram", False, f"heartbeat corrompu : {raw!r}"))
+            else:
+                age = now - bot_beat
+                ok = age < BOT_HEARTBEAT_LIMIT
+                detail = (
+                    f"dernier getUpdates il y a {_age(age)} (seuil {_age(BOT_HEARTBEAT_LIMIT)})"
+                )
+                checks.append(HealthCheck("bot telegram", ok, detail))
     return checks
 
 

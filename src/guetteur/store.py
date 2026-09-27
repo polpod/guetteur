@@ -88,6 +88,34 @@ CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+-- Cache des résumés par niveau de détail (Lot 5). Chaque niveau est généré une
+-- fois puis servi depuis ce cache (les boutons Bref/Standard/Détaillé du bot).
+CREATE TABLE IF NOT EXISTS summaries (
+    video_id     TEXT NOT NULL,
+    detail       TEXT NOT NULL,
+    summary_json TEXT NOT NULL,
+    created_at   TEXT NOT NULL,
+    PRIMARY KEY (video_id, detail)
+);
+-- Association message Telegram ↔ vidéo (Lot 5). Permet de retrouver la vidéo depuis
+-- un reply ou un callback sur n'importe quel message envoyé par le bot.
+CREATE TABLE IF NOT EXISTS telegram_messages (
+    message_id INTEGER PRIMARY KEY,
+    video_id   TEXT NOT NULL,
+    kind       TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_tg_msg_video ON telegram_messages(video_id);
+-- Historique des Q&A par vidéo (Lot 5). Les 6 derniers échanges sont réinjectés
+-- pour permettre les relances.
+CREATE TABLE IF NOT EXISTS qa (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    video_id   TEXT NOT NULL,
+    question   TEXT NOT NULL,
+    answer     TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_qa_video ON qa(video_id, id);
 """
 )
 
@@ -165,7 +193,10 @@ class Store:
     def __init__(self, path: Path | str) -> None:
         if str(path) != ":memory:":
             Path(path).parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(path), isolation_level=None)
+        # `check_same_thread=False` : le Lot 5 partage le store entre le thread du
+        # pipeline principal et le thread du bot Telegram. La cohérence est assurée
+        # par SQLite (WAL + busy_timeout) et par le verrou Claude côté applicatif.
+        self._conn = sqlite3.connect(str(path), isolation_level=None, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=5000")
@@ -536,6 +567,58 @@ class Store:
     def counts(self) -> dict[str, int]:
         rows = self._conn.execute("SELECT status, COUNT(*) AS n FROM videos GROUP BY status")
         return {str(r["status"]): int(r["n"]) for r in rows}
+
+    # --- bot Telegram (Lot 5) --------------------------------------------------------------
+
+    def cache_summary(self, video_id: str, detail: str, summary_json: str) -> None:
+        """Enregistre le résumé d'un niveau donné dans le cache multi-niveaux.
+        Les résumés déjà présents pour ce (video_id, detail) sont écrasés."""
+        self._conn.execute(
+            "INSERT INTO summaries (video_id, detail, summary_json, created_at) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(video_id, detail) DO UPDATE SET "
+            "summary_json = excluded.summary_json, created_at = excluded.created_at",
+            (video_id, detail, summary_json, _now()),
+        )
+
+    def cached_summary(self, video_id: str, detail: str) -> str | None:
+        row = self._conn.execute(
+            "SELECT summary_json FROM summaries WHERE video_id = ? AND detail = ?",
+            (video_id, detail),
+        ).fetchone()
+        return str(row["summary_json"]) if row else None
+
+    def link_message(self, message_id: int, video_id: str, kind: str) -> None:
+        """Associe un message Telegram à une vidéo. `kind` distingue le type de message
+        (« summary », « question », « answer »…) pour aider au diagnostic."""
+        self._conn.execute(
+            "INSERT INTO telegram_messages (message_id, video_id, kind, created_at) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(message_id) DO UPDATE SET video_id = excluded.video_id, "
+            "kind = excluded.kind, created_at = excluded.created_at",
+            (message_id, video_id, kind, _now()),
+        )
+
+    def video_for_message(self, message_id: int) -> str | None:
+        row = self._conn.execute(
+            "SELECT video_id FROM telegram_messages WHERE message_id = ?", (message_id,)
+        ).fetchone()
+        return str(row["video_id"]) if row else None
+
+    def record_qa(self, video_id: str, question: str, answer: str) -> None:
+        self._conn.execute(
+            "INSERT INTO qa (video_id, question, answer, created_at) VALUES (?, ?, ?, ?)",
+            (video_id, question, answer, _now()),
+        )
+
+    def recent_qa(self, video_id: str, limit: int = 6) -> list[tuple[str, str]]:
+        """Retourne les `limit` derniers échanges Q&A pour cette vidéo, dans l'ordre
+        chronologique (le plus ancien d'abord) — prêts à être réinjectés en contexte."""
+        rows = self._conn.execute(
+            "SELECT question, answer FROM qa WHERE video_id = ? ORDER BY id DESC LIMIT ?",
+            (video_id, limit),
+        ).fetchall()
+        return [(str(r["question"]), str(r["answer"])) for r in reversed(rows)]
 
     def _update(
         self,

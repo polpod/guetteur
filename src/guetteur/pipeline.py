@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import timedelta
+from typing import Any
 
 from guetteur.archive.base import ArchiveError, Archiver, NoOpArchiver, redact
 from guetteur.config import Config, ConfigError, NotifyChannel, PlaylistConfig
@@ -79,7 +81,12 @@ def transcript_from_json(video_id: str, raw: str) -> Transcript:
     )
 
 
-def build_message(summary: Summary, video: Video, label: str) -> Message:
+def build_message(
+    summary: Summary,
+    video: Video,
+    label: str,
+    reply_markup: dict[str, Any] | None = None,
+) -> Message:
     md_raw = render_markdown_v2(summary, video, label)
     plain_raw = render_plain(summary, video, label)
     md_parts = numbered(split_markdown_v2_parts(md_raw, TELEGRAM_LIMIT), escape=True)
@@ -94,6 +101,7 @@ def build_message(summary: Summary, video: Video, label: str) -> Message:
         short=f"{summary.title} — {video.url}",
         markdown_v2_parts=tuple(md_parts) if len(md_parts) > 1 else (),
         plain_parts=tuple(plain_parts) if len(plain_parts) > 1 else (),
+        reply_markup=reply_markup,
     )
 
 
@@ -109,6 +117,7 @@ class Pipeline:
         sleep: Callable[[float], None] = time.sleep,
         archiver: Archiver | None = None,
         detail_override: DetailLevel | None = None,
+        claude_lock: threading.Lock | None = None,
     ) -> None:
         self._config = config
         self._store = store
@@ -123,6 +132,9 @@ class Pipeline:
         # `--detail` sur once/backfill/reset), jamais persistée. None = respecter la
         # playlist. Le prochain cycle sans override retombe sur playlist.detail.
         self._detail_override: DetailLevel | None = detail_override
+        # Verrou Claude partagé avec le bot Telegram (Lot 5) : jamais deux appels
+        # concurrents à Claude. Par défaut un lock local (comportement historique).
+        self._claude_lock: threading.Lock = claude_lock or threading.Lock()
 
     # --- découverte ------------------------------------------------------------------------
 
@@ -265,10 +277,11 @@ class Pipeline:
                     self._store.set_transcript(vid, transcript_to_json(transcript))
                     log.info("video.transcribed", extra={**ctx, "source": transcript.source})
                 detail = self._detail_override or playlist.detail
-                summary = self._summarizer.summarize(
-                    transcript,
-                    SummaryMeta(video=video, language=playlist.language, detail=detail),
-                )
+                with self._claude_lock:
+                    summary = self._summarizer.summarize(
+                        transcript,
+                        SummaryMeta(video=video, language=playlist.language, detail=detail),
+                    )
             except SummarizerUnavailableError:
                 raise  # problème de backend, pas de la vidéo : ne consomme pas d'essai
             except NoTranscriptError as exc:
@@ -283,9 +296,30 @@ class Pipeline:
             state = current.status.value if current else "inconnue"
             log.warning("video.not_claimable", extra={**ctx, "status": state})
             return "skipped"
+        # Cache multi-niveaux du Lot 5 : le résumé fraîchement généré est enregistré
+        # sous son niveau. Les boutons du bot peuvent le servir sans rappeler Claude.
+        self._store.cache_summary(vid, summary.detail, summary_to_json(summary))
+        reply_markup = self._reply_markup_for(playlist, vid, summary.detail)
         return self._deliver(
-            vid, playlist, video, summary, build_message(summary, video, playlist.label)
+            vid,
+            playlist,
+            video,
+            summary,
+            build_message(summary, video, playlist.label, reply_markup=reply_markup),
         )
+
+    def _reply_markup_for(
+        self, playlist: PlaylistConfig, video_id: str, detail: DetailLevel
+    ) -> dict[str, Any] | None:
+        """Boutons inline sous le résumé quand le bot Telegram est actif et que la
+        playlist envoie sur Telegram. Rien sur WhatsApp (l'API ne gère pas ce clavier)."""
+        if not self._config.telegram.interactive or playlist.notify != "telegram":
+            return None
+        # Import local pour éviter la dépendance à `notify/telegram_bot.py` quand le bot
+        # n'est pas utilisé (tests, provider WhatsApp uniquement…).
+        from guetteur.notify.telegram_bot import build_summary_keyboard
+
+        return build_summary_keyboard(video_id, detail)
 
     # --- envoi -----------------------------------------------------------------------------
 
@@ -351,6 +385,14 @@ class Pipeline:
                 )
                 self._store.mark_sent(vid)
                 log.info("video.sent", extra={**ctx, "attempt": attempt})
+                # Lot 5 : chaque message Telegram envoyé est lié à la vidéo pour que
+                # l'utilisateur puisse répondre à N'IMPORTE quelle partie et poser une
+                # question. WhatsApp n'utilise pas ce mécanisme.
+                if channel == "telegram" and provider_id:
+                    for raw in provider_id.split(","):
+                        raw = raw.strip()
+                        if raw.isdigit():
+                            self._store.link_message(int(raw), vid, kind="summary:auto")
                 self._maybe_archive(vid, video, summary, playlist.label)
                 return "sent"
             if last is not None:

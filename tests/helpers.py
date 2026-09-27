@@ -10,7 +10,7 @@ from typing import Any
 from unittest.mock import MagicMock
 from xml.sax.saxutils import escape
 
-from guetteur.config import Config, PlaylistConfig, Secrets, TranscriptConfig
+from guetteur.config import Config, PlaylistConfig, Secrets, TelegramConfig, TranscriptConfig
 from guetteur.models import Segment, Transcript
 from guetteur.notify.base import Message, Notifier, NotifyError
 from guetteur.transcript.base import NoTranscriptError
@@ -23,6 +23,9 @@ def make_config(tmp_path: Path, **overrides: Any) -> Config:
         "playlists": (PlaylistConfig(id="PLtest123", label="Veille IA"),),
         "data_dir": tmp_path,
         "transcript": TranscriptConfig(max_retries=3),
+        # Bot Telegram désactivé par défaut dans les tests : les tests qui exercent
+        # spécifiquement le bot injectent `TelegramConfig(interactive=True)` explicite.
+        "telegram": TelegramConfig(interactive=False),
         "secrets": Secrets(telegram_bot_token="TOKEN", telegram_chat_id="42"),
     }
     base.update(overrides)

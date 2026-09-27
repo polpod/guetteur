@@ -12,6 +12,7 @@ import time
 from collections.abc import Sequence
 from pathlib import Path
 from types import FrameType
+from typing import Any
 
 import schedule
 from dotenv import load_dotenv
@@ -40,7 +41,10 @@ def build_archiver(config: Config, store: Store) -> Archiver:
 
 
 def build_pipeline(
-    config: Config, store: Store, detail_override: DetailLevel | None = None
+    config: Config,
+    store: Store,
+    detail_override: DetailLevel | None = None,
+    claude_lock: Any = None,
 ) -> Pipeline:
     from guetteur.sources.rss import RssSource
     from guetteur.summarize import build_summarizer
@@ -75,6 +79,7 @@ def build_pipeline(
         notifier_factory=lambda channel: build_notifier(channel, config),
         archiver=build_archiver(config, store),
         detail_override=detail_override,
+        claude_lock=claude_lock,
     )
 
 
@@ -88,8 +93,13 @@ def cmd_once(config: Config, detail: DetailLevel | None = None) -> int:
 
 
 def cmd_run(config: Config) -> int:
+    import threading
+
     store = Store(config.db_path)
-    pipeline = build_pipeline(config, store)
+    # Verrou Claude partagé pipeline ↔ bot (Lot 5) : jamais deux appels concurrents.
+    claude_lock = threading.Lock()
+    pipeline = build_pipeline(config, store, claude_lock=claude_lock)
+    bot = _maybe_start_bot(config, store, pipeline, claude_lock)
     stopping = False
 
     def _stop(signum: int, _frame: FrameType | None) -> None:
@@ -113,6 +123,7 @@ def cmd_run(config: Config) -> int:
             "playlists": [p.id for p in config.playlists],
             "model": config.claude_model,
             "provider": config.summarize.provider,
+            "bot_interactive": bot is not None,
         },
     )
     schedule.every(config.poll_interval_seconds).seconds.do(job)
@@ -123,8 +134,57 @@ def cmd_run(config: Config) -> int:
             time.sleep(1)
     finally:
         schedule.clear()
+        if bot is not None:
+            bot.stop()
         store.close()
     return 0
+
+
+def _maybe_start_bot(config: Config, store: Store, pipeline: Pipeline, claude_lock: Any) -> Any:
+    """Instancie et démarre le bot Telegram si `[telegram] interactive = true` ET si
+    les jetons Telegram sont présents. En dev/tests sans jetons, retourne None sans
+    lever : `guetteur run` continue à tourner en mode « envoi automatique seul »."""
+    if not config.telegram.interactive:
+        log.info("telegram_bot.disabled_by_config")
+        return None
+    if not config.secrets.telegram_bot_token or not config.secrets.telegram_chat_id:
+        log.info("telegram_bot.disabled_missing_tokens")
+        return None
+    try:
+        from guetteur.notify import build_notifier
+        from guetteur.notify.telegram import TelegramNotifier
+        from guetteur.notify.telegram_bot import TelegramBot
+        from guetteur.summarize import build_summarizer
+        from guetteur.summarize.qa import build_answerer_from_summarizer
+
+        raw_notifier = build_notifier("telegram", config)
+        if not isinstance(raw_notifier, TelegramNotifier):  # pragma: no cover - défensif
+            log.info("telegram_bot.disabled_wrong_notifier")
+            return None
+        notifier = raw_notifier
+        summarizer = build_summarizer(config)
+        answerer = build_answerer_from_summarizer(summarizer)
+
+        def playlist_for(playlist_id: str) -> PlaylistConfig:
+            try:
+                return config.playlist(playlist_id)
+            except ConfigError:
+                return PlaylistConfig(id=playlist_id, label=playlist_id)
+
+        bot = TelegramBot(
+            config=config,
+            store=store,
+            summarizer=summarizer,
+            question_answerer=answerer,
+            claude_lock=claude_lock,
+            notifier=notifier,
+            get_playlist=playlist_for,
+        )
+        bot.start()
+        return bot
+    except Exception:
+        log.exception("telegram_bot.start_failed")
+        return None
 
 
 def cmd_backfill(

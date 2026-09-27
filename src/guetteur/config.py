@@ -86,6 +86,22 @@ class ArchiveConfig:
 
 
 @dataclass(frozen=True)
+class TelegramConfig:
+    # Bot Telegram interactif : long polling, boutons sous chaque résumé, questions
+    # libres via reply ou bouton. Voir docs/README.md § « Bot interactif ».
+    interactive: bool = True
+    # Timeout du long polling getUpdates, en secondes (max 50 côté Telegram).
+    poll_timeout_s: int = 50
+    # Fenêtre glissante pour le rate limit des générations par le bot.
+    rate_limit_per_hour: int = 10
+    # Durée de vie d'un état « en attente de question » posé par le bouton Question.
+    question_ttl_min: int = 10
+    # Nombre d'échanges Q&A précédents réinjectés dans le contexte pour permettre
+    # les relances sur la même vidéo.
+    qa_history_size: int = 6
+
+
+@dataclass(frozen=True)
 class WhatsAppConfig:
     api_version: str = "v20.0"
     template_name: str = "hello_world"
@@ -127,6 +143,7 @@ class Config:
     summarize: SummarizeConfig = field(default_factory=SummarizeConfig)
     notify: NotifyConfig = field(default_factory=NotifyConfig)
     whatsapp: WhatsAppConfig = field(default_factory=WhatsAppConfig)
+    telegram: TelegramConfig = field(default_factory=TelegramConfig)
     archive: ArchiveConfig = field(default_factory=ArchiveConfig)
     secrets: Secrets = field(default_factory=Secrets)
 
@@ -240,8 +257,31 @@ def _parse_archive(raw: dict[str, Any]) -> ArchiveConfig:
     )
 
 
+def _parse_telegram(raw: dict[str, Any]) -> TelegramConfig:
+    return TelegramConfig(
+        interactive=bool(raw.get("interactive", True)),
+        poll_timeout_s=_positive_int(raw.get("poll_timeout_s", 50), "telegram.poll_timeout_s"),
+        rate_limit_per_hour=_positive_int(
+            raw.get("rate_limit_per_hour", 10), "telegram.rate_limit_per_hour"
+        ),
+        question_ttl_min=_positive_int(
+            raw.get("question_ttl_min", 10), "telegram.question_ttl_min"
+        ),
+        qa_history_size=_positive_int(raw.get("qa_history_size", 6), "telegram.qa_history_size"),
+    )
+
+
 _SECTIONS = frozenset(
-    {"general", "transcript", "summarize", "notify", "whatsapp", "archive", "playlists"}
+    {
+        "general",
+        "transcript",
+        "summarize",
+        "notify",
+        "whatsapp",
+        "telegram",
+        "archive",
+        "playlists",
+    }
 )
 
 
@@ -284,6 +324,7 @@ def parse_config(data: dict[str, Any], secrets: Secrets | None = None) -> Config
             template_language=str(wa.get("template_language", "en_US")),
             template_body_param=bool(wa.get("template_body_param", False)),
         ),
+        telegram=_parse_telegram(data.get("telegram", {})),
         archive=_parse_archive(data.get("archive", {})),
         secrets=secrets if secrets is not None else Secrets.from_env(),
     )
