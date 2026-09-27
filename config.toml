@@ -29,13 +29,13 @@ sending_timeout_min = 10          # un envoi « sending » plus ancien est repri
 [archive]
 # Archivage optionnel de la veille dans Google NotebookLM (extra `notebooklm`).
 # Voir docs/audit-notebooklm/RAPPORT.md §8 pour les conditions de sécurité.
-enabled = false
+enabled = true
 notebook_name = "Veille YouTube"
 # Compte Google dédié attendu (guetteur doctor vérifie l'égalité avec l'API).
-account = ""
+account = "guetteur.veille@gmail.com"
 # NOTEBOOKLM_HOME dédié : refus de démarrer si ce n'est pas en 0700.
 # Défaut : /opt/guetteur/data/nlm en prod (LXC), ~/.guetteur-nlm en dev.
-# home = "/opt/guetteur/data/nlm"
+home = "/home/polpod/.guetteur-nlm"
 # Rotation automatique du notebook au-delà de ce nombre de sources.
 max_sources_per_notebook = 45
 # Version épinglée dans pyproject.toml (extra notebooklm) et vérifiée par doctor.
