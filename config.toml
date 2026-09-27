@@ -18,7 +18,7 @@ max_retries = 3             # nouveaux essais (1 par cycle) avant abandon
 # "claude_api"  : SDK anthropic, nécessite ANTHROPIC_API_KEY dans .env.
 provider = "claude_code"
 claude_code_bin = "claude"  # nom dans le PATH ou chemin absolu
-timeout_s = 180             # délai maximal par appel (secondes)
+timeout_s = 600             # délai maximal par appel (secondes)
 
 [notify]
 fallback = "telegram"             # canal de secours après un échec définitif ("" = aucun)
