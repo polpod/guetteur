@@ -7,15 +7,22 @@ from typing import Any
 
 import anthropic
 
+from guetteur.models import DetailLevel
 from guetteur.summarize.base import (
-    SUMMARY_SCHEMA,
-    SYSTEM_PROMPT,
     ChunkedSummarizer,
     SummarizeError,
     SummarizerUnavailableError,
+    schema_for,
+    system_prompt_for,
 )
 
-MAX_TOKENS = 8_000
+# Le mode détaillé produit ~1500 mots + JSON structure : on double la marge côté modèle.
+MAX_TOKENS_STANDARD = 8_000
+MAX_TOKENS_DETAILED = 16_000
+
+
+def _max_tokens_for(detail: DetailLevel) -> int:
+    return MAX_TOKENS_DETAILED if detail == "detaille" else MAX_TOKENS_STANDARD
 
 
 class ClaudeApiSummarizer(ChunkedSummarizer):
@@ -23,14 +30,16 @@ class ClaudeApiSummarizer(ChunkedSummarizer):
         self._client = client
         self._model = model
 
-    def _complete(self, instruction: str, document: str) -> dict[str, Any]:
+    def _complete(self, instruction: str, document: str, detail: DetailLevel) -> dict[str, Any]:
         try:
             response = self._client.messages.create(
                 model=self._model,
-                max_tokens=MAX_TOKENS,
-                system=SYSTEM_PROMPT,
+                max_tokens=_max_tokens_for(detail),
+                system=system_prompt_for(detail),
                 messages=[{"role": "user", "content": f"{instruction}\n\n{document}"}],
-                output_config={"format": {"type": "json_schema", "schema": SUMMARY_SCHEMA}},
+                output_config={
+                    "format": {"type": "json_schema", "schema": schema_for(detail)},
+                },
             )
         except (anthropic.AuthenticationError, anthropic.PermissionDeniedError) as exc:
             raise SummarizerUnavailableError(

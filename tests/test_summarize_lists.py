@@ -158,7 +158,9 @@ class _Canned(ChunkedSummarizer):
         self.payload = payload
         self.instructions: list[str] = []
 
-    def _complete(self, instruction: str, document: str) -> dict[str, Any]:
+    def _complete(
+        self, instruction: str, document: str, detail: str = "standard"
+    ) -> dict[str, Any]:
         self.instructions.append(instruction)
         return self.payload
 

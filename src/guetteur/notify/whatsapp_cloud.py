@@ -111,7 +111,11 @@ class WhatsAppCloudNotifier(Notifier):
         return self._message_id(self._post({"type": "template", "template": template}))
 
     def send(self, message: Message) -> str | None:
-        parts = split_message(message.plain, WHATSAPP_TEXT_LIMIT)
+        parts = (
+            list(message.plain_parts)
+            if message.plain_parts
+            else split_message(message.plain, WHATSAPP_TEXT_LIMIT)
+        )
         try:
             first = self._send_text(parts[0])
         except WindowClosedError:

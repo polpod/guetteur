@@ -11,7 +11,7 @@ from datetime import timedelta
 
 from guetteur.archive.base import ArchiveError, Archiver, NoOpArchiver, redact
 from guetteur.config import Config, ConfigError, NotifyChannel, PlaylistConfig
-from guetteur.models import Segment, Summary, Transcript, Video
+from guetteur.models import DetailLevel, Segment, Summary, Transcript, Video
 from guetteur.notify.base import Message, Notifier, NotifyError
 from guetteur.sources.base import SourceError, VideoSource
 from guetteur.store import PENDING_STATUSES, Status, Store, VideoRecord
@@ -24,12 +24,18 @@ from guetteur.summarize.base import (
     summary_to_json,
 )
 from guetteur.summarize.format import (
+    TELEGRAM_LIMIT,
+    numbered,
     render_markdown,
     render_markdown_v2,
     render_no_transcript,
     render_plain,
+    split_markdown_v2_parts,
+    split_plain_parts,
 )
 from guetteur.transcript.base import NoTranscriptError, TranscriptError, TranscriptProvider
+
+WHATSAPP_LIMIT = 4096
 
 log = logging.getLogger(__name__)
 
@@ -74,10 +80,20 @@ def transcript_from_json(video_id: str, raw: str) -> Transcript:
 
 
 def build_message(summary: Summary, video: Video, label: str) -> Message:
+    md_raw = render_markdown_v2(summary, video, label)
+    plain_raw = render_plain(summary, video, label)
+    md_parts = numbered(split_markdown_v2_parts(md_raw, TELEGRAM_LIMIT), escape=True)
+    plain_parts = numbered(split_plain_parts(plain_raw, WHATSAPP_LIMIT), escape=False)
+    # Pour la rétrocompatibilité on remplit toujours markdown_v2/plain avec la string
+    # complète (utilisée par les tests et le rendu archive). Les notifiers préfèrent les
+    # `*_parts` quand ils sont non vides ; on ne les remplit que si un découpage réel a
+    # eu lieu, sinon le comportement reste identique aux Lots 1/2/3.
     return Message(
-        markdown_v2=render_markdown_v2(summary, video, label),
-        plain=render_plain(summary, video, label),
+        markdown_v2=md_parts[0] if len(md_parts) == 1 else md_raw,
+        plain=plain_parts[0] if len(plain_parts) == 1 else plain_raw,
         short=f"{summary.title} — {video.url}",
+        markdown_v2_parts=tuple(md_parts) if len(md_parts) > 1 else (),
+        plain_parts=tuple(plain_parts) if len(plain_parts) > 1 else (),
     )
 
 
@@ -92,6 +108,7 @@ class Pipeline:
         notifier_factory: NotifierFactory,
         sleep: Callable[[float], None] = time.sleep,
         archiver: Archiver | None = None,
+        detail_override: DetailLevel | None = None,
     ) -> None:
         self._config = config
         self._store = store
@@ -102,6 +119,10 @@ class Pipeline:
         self._notifiers: dict[NotifyChannel, Notifier] = {}
         self._sleep = sleep
         self._archiver: Archiver = archiver or NoOpArchiver()
+        # Surcharge du niveau de détail choisi côté playlist : appliqué en session (CLI
+        # `--detail` sur once/backfill/reset), jamais persistée. None = respecter la
+        # playlist. Le prochain cycle sans override retombe sur playlist.detail.
+        self._detail_override: DetailLevel | None = detail_override
 
     # --- découverte ------------------------------------------------------------------------
 
@@ -243,8 +264,10 @@ class Pipeline:
                     transcript = self._transcriber.get(vid)
                     self._store.set_transcript(vid, transcript_to_json(transcript))
                     log.info("video.transcribed", extra={**ctx, "source": transcript.source})
+                detail = self._detail_override or playlist.detail
                 summary = self._summarizer.summarize(
-                    transcript, SummaryMeta(video=video, language=playlist.language)
+                    transcript,
+                    SummaryMeta(video=video, language=playlist.language, detail=detail),
                 )
             except SummarizerUnavailableError:
                 raise  # problème de backend, pas de la vidéo : ne consomme pas d'essai

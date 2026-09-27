@@ -56,7 +56,11 @@ class TelegramNotifier(Notifier):
         return str(message_id) if message_id is not None else None
 
     def send(self, message: Message) -> str | None:
-        parts = split_message(message.markdown_v2, TELEGRAM_LIMIT)
+        parts = (
+            list(message.markdown_v2_parts)
+            if message.markdown_v2_parts
+            else split_message(message.markdown_v2, TELEGRAM_LIMIT)
+        )
         ids: list[str] = []
         for part in parts:
             message_id = self._post(

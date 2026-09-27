@@ -33,12 +33,20 @@ def is_retryable_status(status_code: int) -> bool:
 
 @dataclass(frozen=True)
 class Message:
-    """Un même contenu dans les deux formats ; chaque canal choisit le sien."""
+    """Un même contenu dans les deux formats ; chaque canal choisit le sien.
+
+    Le Lot 4 permet de fournir directement les parts pré-découpées (résumés détaillés qui
+    dépassent la limite Telegram et doivent être coupés aux frontières de section, avec
+    numérotation « (i/N) »). Si `markdown_v2_parts` / `plain_parts` sont non vides, chaque
+    canal les envoie tels quels — sinon on retombe sur le découpage automatique."""
 
     markdown_v2: str
     plain: str
     # Texte court (titre + lien) utilisable comme variable de modèle WhatsApp.
     short: str = ""
+    # Parts pré-découpées avec numérotation ; longueur == nombre de messages à envoyer.
+    markdown_v2_parts: tuple[str, ...] = ()
+    plain_parts: tuple[str, ...] = ()
 
 
 class Notifier(ABC):

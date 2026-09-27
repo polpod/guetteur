@@ -17,12 +17,13 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from guetteur.models import DetailLevel
 from guetteur.summarize.base import (
-    SUMMARY_SCHEMA,
-    SYSTEM_PROMPT,
     ChunkedSummarizer,
     SummarizeError,
     SummarizerUnavailableError,
+    schema_for,
+    system_prompt_for,
 )
 
 log = logging.getLogger(__name__)
@@ -128,13 +129,13 @@ class ClaudeCodeSummarizer(ChunkedSummarizer):
             "",
         ]
 
-    def build_command(self, instruction: str) -> list[str]:
+    def build_command(self, instruction: str, detail: DetailLevel = "standard") -> list[str]:
         return [
             *self._base_args(instruction),
             "--system-prompt",
-            SYSTEM_PROMPT,
+            system_prompt_for(detail),
             "--json-schema",
-            json.dumps(SUMMARY_SCHEMA, separators=(",", ":")),
+            json.dumps(schema_for(detail), separators=(",", ":")),
         ]
 
     # --- exécution -------------------------------------------------------------------------
@@ -205,8 +206,8 @@ class ClaudeCodeSummarizer(ChunkedSummarizer):
             f"Claude Code : échec (code {res.returncode}) : {detail[:300] or 'sortie vide'}"
         )
 
-    def _complete(self, instruction: str, document: str) -> dict[str, Any]:
-        res = asyncio.run(self._run(self.build_command(instruction), document))
+    def _complete(self, instruction: str, document: str, detail: DetailLevel) -> dict[str, Any]:
+        res = asyncio.run(self._run(self.build_command(instruction, detail), document))
         envelope = self._parse_envelope(res)
         result = envelope.get("result")
         if isinstance(result, str) and result.strip():

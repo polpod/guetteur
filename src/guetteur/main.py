@@ -1,5 +1,5 @@
 """Point d'entrée CLI : guetteur run | once | backfill | status | retry | reset | health |
-archive | test-notify | doctor | auth."""
+archive | compare | test-notify | doctor | auth."""
 
 from __future__ import annotations
 
@@ -19,8 +19,9 @@ from dotenv import load_dotenv
 from guetteur.archive.base import Archiver, NoOpArchiver
 from guetteur.config import Config, ConfigError, NotifyChannel, PlaylistConfig, load_config
 from guetteur.logs import setup_logging
-from guetteur.models import KeyPoint, Summary, Video
+from guetteur.models import DETAIL_LEVELS, DetailLevel, KeyPoint, Summary, Video
 from guetteur.notify import NotifyError, build_notifier
+from guetteur.notify.base import Message
 from guetteur.pipeline import Pipeline, build_message
 from guetteur.sources.base import SourceError, VideoSource
 from guetteur.store import Status, Store
@@ -38,7 +39,9 @@ def build_archiver(config: Config, store: Store) -> Archiver:
     return NotebookLMArchiver(config.archive, store)
 
 
-def build_pipeline(config: Config, store: Store) -> Pipeline:
+def build_pipeline(
+    config: Config, store: Store, detail_override: DetailLevel | None = None
+) -> Pipeline:
     from guetteur.sources.rss import RssSource
     from guetteur.summarize import build_summarizer
     from guetteur.transcript import Transcriber
@@ -71,13 +74,14 @@ def build_pipeline(config: Config, store: Store) -> Pipeline:
         summarizer=summarizer,
         notifier_factory=lambda channel: build_notifier(channel, config),
         archiver=build_archiver(config, store),
+        detail_override=detail_override,
     )
 
 
-def cmd_once(config: Config) -> int:
+def cmd_once(config: Config, detail: DetailLevel | None = None) -> int:
     store = Store(config.db_path)
     try:
-        stats = build_pipeline(config, store).run_cycle()
+        stats = build_pipeline(config, store, detail_override=detail).run_cycle()
     finally:
         store.close()
     return 1 if stats.failed or stats.aborted else 0
@@ -123,10 +127,17 @@ def cmd_run(config: Config) -> int:
     return 0
 
 
-def cmd_backfill(config: Config, playlist_id: str, limit: int, force: bool) -> int:
+def cmd_backfill(
+    config: Config,
+    playlist_id: str,
+    limit: int,
+    force: bool,
+    detail: DetailLevel | None = None,
+) -> int:
     store = Store(config.db_path)
     try:
-        stats = build_pipeline(config, store).backfill(playlist_id, limit, force=force)
+        pipeline = build_pipeline(config, store, detail_override=detail)
+        stats = pipeline.backfill(playlist_id, limit, force=force)
     finally:
         store.close()
     return 1 if stats.failed or stats.aborted else 0
@@ -201,21 +212,30 @@ def cmd_retry(config: Config, video_id: str | None) -> int:
     return 0
 
 
-def cmd_reset(config: Config, video_id: str) -> int:
+def cmd_reset(config: Config, video_id: str, detail: DetailLevel | None = None) -> int:
     store = Store(config.db_path)
-    try:
-        before = store.reset(video_id)
-    finally:
-        store.close()
+    before = store.reset(video_id)
     if before is None:
+        store.close()
         print(f"❌ Vidéo inconnue : {video_id}", file=sys.stderr)
         return 1
     log.info("video.reset", extra={"video_id": video_id, "previous_status": before.status.value})
     print(f"✅ {video_id} remise en « new » (était : {before.status.value}).")
-    print("   Transcription, résumé et envoi seront refaits au prochain cycle.")
     if before.really_sent:
         print("⚠️  Cette vidéo avait déjà été envoyée : elle le sera une seconde fois.")
-    return 0
+    if detail is None:
+        store.close()
+        print("   Transcription, résumé et envoi seront refaits au prochain cycle.")
+        return 0
+    # --detail : on lance un cycle immédiat avec l'override pour retraiter la vidéo avec
+    # le niveau choisi. La surcharge n'est pas persistée : les cycles suivants
+    # retomberont sur le niveau de la playlist.
+    print(f"   Retraitement immédiat en niveau « {detail} »…")
+    try:
+        stats = build_pipeline(config, store, detail_override=detail).run_cycle()
+    finally:
+        store.close()
+    return 1 if stats.failed or stats.aborted else 0
 
 
 def cmd_archive(config: Config, video_id: str | None, pending: bool) -> int:
@@ -345,6 +365,92 @@ def _sample_message() -> tuple[Summary, Video]:
     return summary, video
 
 
+def cmd_compare(config: Config, video_id: str, channel: NotifyChannel | None = None) -> int:
+    """Génère les 3 niveaux de détail pour la même vidéo et envoie chacun sur le canal
+    choisi (défaut : le canal de la playlist de la vidéo), avec un en-tête « [BREF] »,
+    « [STANDARD] », « [DETAILLE] » en tête du texte. Ne touche PAS au statut de la vidéo
+    en base : le résumé de comparaison n'est jamais persisté."""
+    from guetteur.pipeline import transcript_from_json
+    from guetteur.summarize.base import SummarizeError, SummaryMeta
+
+    store = Store(config.db_path)
+    try:
+        record = store.get(video_id)
+        if record is None:
+            print(f"❌ Vidéo inconnue : {video_id}", file=sys.stderr)
+            return 1
+        if record.transcript is None:
+            print(
+                f"❌ {video_id} n'a pas encore de transcription en base — lancez d'abord "
+                "`guetteur once` (ou `backfill --playlist … --limit 1`).",
+                file=sys.stderr,
+            )
+            return 1
+
+        try:
+            playlist = config.playlist(record.playlist_id)
+        except ConfigError:
+            playlist = PlaylistConfig(id=record.playlist_id, label=record.playlist_id)
+        target_channel: NotifyChannel = channel or playlist.notify
+        transcript = transcript_from_json(video_id, record.transcript)
+        video = record.to_video()
+    finally:
+        store.close()
+
+    from guetteur.summarize import build_summarizer
+
+    summarizer = build_summarizer(config)
+    notifier = build_notifier(target_channel, config)
+    code = 0
+    for level in DETAIL_LEVELS:
+        header = f"[{level.upper()}]"
+        print(f"→ génération {header}…")
+        try:
+            summary = summarizer.summarize(
+                transcript,
+                SummaryMeta(video=video, language=playlist.language, detail=level),
+            )
+        except SummarizeError as exc:
+            print(f"❌ {header} : {exc}", file=sys.stderr)
+            code = 1
+            continue
+        message = _prepend_header(build_message(summary, video, playlist.label), header)
+        try:
+            notifier.send(message)
+            log.info(
+                "compare.sent",
+                extra={"video_id": video_id, "detail": level, "channel": target_channel},
+            )
+            print(f"✅ {header} envoyé sur {target_channel}")
+        except NotifyError as exc:
+            print(f"❌ {header} : {exc}", file=sys.stderr)
+            log.error(
+                "compare.failed",
+                extra={"video_id": video_id, "detail": level, "error": str(exc)},
+            )
+            code = 1
+    return code
+
+
+def _prepend_header(message: Message, header: str) -> Message:
+    """Ajoute un en-tête « [BREF] » (ou similaire) en tête de chaque part.
+    Les caractères MarkdownV2 sensibles du header sont échappés."""
+    from guetteur.summarize.format import escape_markdown_v2
+
+    md_header = escape_markdown_v2(header)
+    md_parts = message.markdown_v2_parts or (message.markdown_v2,)
+    plain_parts = message.plain_parts or (message.plain,)
+    new_md = tuple(f"{md_header}\n{p}" for p in md_parts)
+    new_plain = tuple(f"{header}\n{p}" for p in plain_parts)
+    return Message(
+        markdown_v2=new_md[0] if len(new_md) == 1 else "\n\n".join(new_md),
+        plain=new_plain[0] if len(new_plain) == 1 else "\n\n".join(new_plain),
+        short=f"{header} {message.short}".strip(),
+        markdown_v2_parts=new_md if len(new_md) > 1 else (),
+        plain_parts=new_plain if len(new_plain) > 1 else (),
+    )
+
+
 def cmd_test_notify(config: Config, channel: NotifyChannel | None) -> int:
     channels: list[NotifyChannel]
     if channel:
@@ -397,14 +503,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="chemin de config.toml (défaut : $GUETTEUR_CONFIG ou ./config.toml)",
     )
     sub = parser.add_subparsers(dest="command", required=True)
+    detail_help = f"niveau de détail du résumé ({', '.join(DETAIL_LEVELS)}) ; surcharge la playlist"
     sub.add_parser("run", help="service : un cycle toutes les N secondes")
-    sub.add_parser("once", help="un seul cycle puis sortie")
+    on = sub.add_parser("once", help="un seul cycle puis sortie")
+    on.add_argument("--detail", choices=list(DETAIL_LEVELS), default=None, help=detail_help)
     bf = sub.add_parser("backfill", help="traite les dernières vidéos d'une playlist")
     bf.add_argument("--playlist", required=True, help="identifiant de la playlist")
     bf.add_argument("--limit", type=int, default=5, help="nombre de vidéos (défaut 5)")
     bf.add_argument(
         "--force", action="store_true", help="reprend aussi les vidéos « failed » de la playlist"
     )
+    bf.add_argument("--detail", choices=list(DETAIL_LEVELS), default=None, help=detail_help)
     st = sub.add_parser("status", help="tableau des vidéos et de leur état")
     st.add_argument("--limit", type=int, default=30, help="nombre de lignes (défaut 30)")
     st.add_argument("--status", choices=[s.value for s in Status], default=None)
@@ -414,6 +523,18 @@ def build_parser() -> argparse.ArgumentParser:
     target.add_argument("--all", action="store_true", help="toutes les vidéos « failed »")
     rs = sub.add_parser("reset", help="retraitement complet d'une vidéo (repasse en « new »)")
     rs.add_argument("--video-id", required=True)
+    rs.add_argument(
+        "--detail",
+        choices=list(DETAIL_LEVELS),
+        default=None,
+        help="retraite immédiatement avec ce niveau (sinon au prochain cycle)",
+    )
+    cp = sub.add_parser(
+        "compare",
+        help="génère les 3 niveaux (bref/standard/detaille) pour une vidéo et envoie chacun",
+    )
+    cp.add_argument("--video-id", required=True)
+    cp.add_argument("--channel", choices=["telegram", "whatsapp"], default=None)
     he = sub.add_parser("health", help="base OK et dernier cycle récent (code retour 1 si KO)")
     he.add_argument(
         "--alert", action="store_true", help="alerte Telegram si KO (au plus une par heure)"
@@ -450,19 +571,21 @@ def cli(argv: Sequence[str] | None = None) -> int:
             case "run":
                 return cmd_run(config)
             case "once":
-                return cmd_once(config)
+                return cmd_once(config, args.detail)
             case "backfill":
-                return cmd_backfill(config, args.playlist, args.limit, args.force)
+                return cmd_backfill(config, args.playlist, args.limit, args.force, args.detail)
             case "status":
                 return cmd_status(config, args.limit, args.status)
             case "retry":
                 return cmd_retry(config, None if args.all else args.video_id)
             case "reset":
-                return cmd_reset(config, args.video_id)
+                return cmd_reset(config, args.video_id, args.detail)
             case "health":
                 return cmd_health(config, args.alert)
             case "archive":
                 return cmd_archive(config, args.video_id, args.pending)
+            case "compare":
+                return cmd_compare(config, args.video_id, args.channel)
             case "test-notify":
                 return cmd_test_notify(config, args.channel)
             case "doctor":

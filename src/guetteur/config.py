@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
+from guetteur.models import DETAIL_LEVELS, DetailLevel
+
 NotifyChannel = Literal["telegram", "whatsapp"]
 _CHANNELS: tuple[NotifyChannel, ...] = ("telegram", "whatsapp")
 SummarizeProvider = Literal["claude_code", "claude_api"]
@@ -29,6 +31,8 @@ class PlaylistConfig:
     language: str = "fr"
     notify: NotifyChannel = "telegram"
     private: bool = False
+    # Niveau de détail du résumé (surchargeable en CLI via --detail).
+    detail: DetailLevel = "standard"
 
 
 @dataclass(frozen=True)
@@ -158,12 +162,19 @@ def _parse_playlist(raw: dict[str, Any]) -> PlaylistConfig:
     notify = raw.get("notify", "telegram")
     if notify not in _CHANNELS:
         raise ConfigError(f"Playlist {pid} : notify doit valoir 'telegram' ou 'whatsapp'")
+    detail = raw.get("detail", "standard")
+    if detail not in DETAIL_LEVELS:
+        raise ConfigError(
+            f"Playlist {pid} : detail doit valoir "
+            f"{', '.join(repr(d) for d in DETAIL_LEVELS)} (reçu : {detail!r})"
+        )
     return PlaylistConfig(
         id=pid,
         label=str(raw.get("label", pid)),
         language=str(raw.get("language", "fr")),
         notify=notify,
         private=bool(raw.get("private", False)),
+        detail=detail,
     )
 
 
