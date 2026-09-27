@@ -17,7 +17,7 @@ from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, cast
 
 import httpx
 
@@ -124,41 +124,94 @@ class TelegramApi:
 @dataclass(frozen=True)
 class CallbackAction:
     video_id: str
-    kind: str  # "detail" ou "question"
+    kind: str  # "detail" | "question" | "keep" | "discard" | "idea"
     detail: DetailLevel | None = None
+    project_slug: str | None = None
 
 
-_CALLBACK_RE = re.compile(r"^v:([A-Za-z0-9_\-]+):(?:d:(bref|standard|detaille)|q)$")
+_CALLBACK_RE = re.compile(
+    r"^v:([A-Za-z0-9_\-]+):"
+    r"(?:"
+    r"d:(bref|standard|detaille)"  # niveau détail
+    r"|q"  # question
+    r"|g"  # garder
+    r"|e"  # écarter
+    r"|i:([a-z0-9_-]{1,32})"  # idée pour <slug>
+    r")$"
+)
 
 
 def parse_callback_data(raw: str) -> CallbackAction | None:
-    """Parse « v:<video_id>:d:<niveau> » ou « v:<video_id>:q ». Retourne None si
-    le format ne correspond pas (attaquant qui forge un callback, id vidéo invalide…).
+    """Parse tous les callbacks du bot (Lot 5 + 6) :
+
+    - `v:<id>:d:<niveau>` → niveau détail (Lot 5).
+    - `v:<id>:q` → question (Lot 5).
+    - `v:<id>:g` / `v:<id>:e` → Garder / Écarter (Lot 6).
+    - `v:<id>:i:<slug>` → envoyer le méga-prompt d'un projet (Lot 6).
+
+    Retourne None sur un format inconnu (protection contre les callbacks forgés).
     """
     m = _CALLBACK_RE.match(raw or "")
     if not m:
         return None
     video_id = m.group(1)
     level = m.group(2)
+    slug = m.group(3)
     if level:
-        return CallbackAction(video_id=video_id, kind="detail", detail=level)  # type: ignore[arg-type]
-    return CallbackAction(video_id=video_id, kind="question")
+        # La regex garantit level ∈ {"bref", "standard", "detaille"} : cast pour mypy.
+        detail = cast("DetailLevel", level)
+        return CallbackAction(video_id=video_id, kind="detail", detail=detail)
+    if slug:
+        return CallbackAction(video_id=video_id, kind="idea", project_slug=slug)
+    tail = raw.rsplit(":", 1)[-1]
+    return CallbackAction(
+        video_id=video_id,
+        kind={"q": "question", "g": "keep", "e": "discard"}[tail],
+    )
 
 
-def build_summary_keyboard(video_id: str, detail_shown: DetailLevel) -> dict[str, Any]:
-    """Construit la ligne de boutons sous un résumé. Le niveau déjà affiché est omis."""
+def build_summary_keyboard(
+    video_id: str,
+    detail_shown: DetailLevel,
+    project_slugs: list[str] | None = None,
+    include_theme_buttons: bool = True,
+) -> dict[str, Any]:
+    """Construit les boutons sous un résumé.
+
+    - Ligne 1 : niveaux (le niveau affiché est omis) + Question.
+    - Ligne 2 (optionnelle Lot 6) : Garder / Écarter.
+    - Lignes suivantes (Lot 6) : un bouton « Idée pour <PROJET> » par projet score ≥ 2.
+    """
     labels: dict[DetailLevel, str] = {
         "bref": "Bref",
         "standard": "Standard",
         "detaille": "Détaillé",
     }
-    row: list[dict[str, str]] = []
+    rows: list[list[dict[str, str]]] = []
+    level_row: list[dict[str, str]] = []
     for level in DETAIL_LEVELS:
         if level == detail_shown:
             continue
-        row.append({"text": labels[level], "callback_data": f"v:{video_id}:d:{level}"})
-    row.append({"text": "Question", "callback_data": f"v:{video_id}:q"})
-    return {"inline_keyboard": [row]}
+        level_row.append({"text": labels[level], "callback_data": f"v:{video_id}:d:{level}"})
+    level_row.append({"text": "Question", "callback_data": f"v:{video_id}:q"})
+    rows.append(level_row)
+    if include_theme_buttons:
+        rows.append(
+            [
+                {"text": "Garder", "callback_data": f"v:{video_id}:g"},
+                {"text": "Écarter", "callback_data": f"v:{video_id}:e"},
+            ]
+        )
+    for slug in project_slugs or []:
+        rows.append(
+            [
+                {
+                    "text": f"Idée pour {slug.upper()}",
+                    "callback_data": f"v:{video_id}:i:{slug}",
+                }
+            ]
+        )
+    return {"inline_keyboard": rows}
 
 
 # --- rate limit -------------------------------------------------------------------------
@@ -396,8 +449,67 @@ class TelegramBot:
         if action.kind == "question":
             self._start_awaiting_question(action.video_id, callback_id)
             return
+        if action.kind == "keep":
+            self._move_note(action.video_id, callback_id, discard=False)
+            return
+        if action.kind == "discard":
+            self._move_note(action.video_id, callback_id, discard=True)
+            return
+        if action.kind == "idea":
+            assert action.project_slug is not None
+            self._send_project_prompt(action.video_id, action.project_slug, callback_id)
+            return
         assert action.detail is not None
         self._deliver_summary_from_button(action.video_id, action.detail, callback_id)
+
+    # --- boutons Lot 6 : Garder / Écarter / Idée pour <projet> --------------------------
+
+    def _move_note(self, video_id: str, callback_id: str, discard: bool) -> None:
+        if not self._config.obsidian.enabled:
+            self._answer_cb(callback_id, "Obsidian désactivé dans config.toml")
+            return
+        try:
+            from guetteur.export.obsidian import ObsidianExporter
+        except ImportError:
+            self._answer_cb(callback_id, "Module d'export absent")
+            return
+        exporter = ObsidianExporter(self._config, self._store)
+        note = self._store.obsidian_note(video_id)
+        if note is None:
+            self._answer_cb(callback_id, "Aucune note Obsidian pour cette vidéo")
+            return
+        if discard:
+            target = exporter.move_to_discarded(video_id)
+            label = "écartée"
+        else:
+            # « Garder » sans thème connu : on demande à l'utilisateur d'utiliser /theme.
+            theme = note[2] or "Inbox"
+            target = exporter.move_to_theme(video_id, theme)
+            label = f"gardée dans « {theme} »"
+        if target is None:
+            self._answer_cb(callback_id, "Déplacement impossible")
+            return
+        self._answer_cb(callback_id, f"OK : {label}")
+        self._send_plain(f"📁 Note {label} : {target.name}")
+
+    def _send_project_prompt(self, video_id: str, project_slug: str, callback_id: str) -> None:
+        rows = self._store.applicability_for(video_id)
+        match = next((r for r in rows if r[0] == project_slug), None)
+        if match is None or not match[6]:
+            self._answer_cb(callback_id, "Aucun méga-prompt pour ce projet")
+            return
+        self._answer_cb(callback_id, f"Méga-prompt {project_slug.upper()} envoyé")
+        prompt = match[6]
+        header = f"Méga-prompt Claude Code — {project_slug.upper()}\n"
+        # Découpage en tranches de ≤ 4096 caractères, texte brut copiable.
+        chunks: list[str] = []
+        limit = 4000
+        text = header + prompt
+        while text:
+            chunks.append(text[:limit])
+            text = text[limit:]
+        for chunk in chunks:
+            self._send_plain(chunk)
 
     def _answer_cb(self, callback_id: str, text: str) -> None:
         try:
@@ -572,7 +684,105 @@ class TelegramBot:
                 return
             self._run_admin(cmd, args)
             return
+        if cmd == "/theme":
+            self._cmd_theme(args)
+            return
+        if cmd == "/projets":
+            self._cmd_projects()
+            return
+        if cmd == "/applicabilite":
+            self._cmd_applicability(args)
+            return
         self._send_plain(f"Commande inconnue : {cmd}. /help pour la liste.")
+
+    def _cmd_theme(self, args: list[str]) -> None:
+        if len(args) < 2:
+            self._send_plain("Usage : /theme <video_id> <thème>")
+            return
+        video_id, theme = args[0], " ".join(args[1:])
+        if not self._config.obsidian.enabled:
+            self._send_plain("Obsidian désactivé dans config.toml")
+            return
+        from guetteur.export.obsidian import ObsidianExporter
+
+        exporter = ObsidianExporter(self._config, self._store)
+        target = exporter.move_to_theme(video_id, theme)
+        if target is None:
+            self._send_plain(f"Aucune note Obsidian pour {video_id}")
+            return
+        self._send_plain(f"📁 {video_id} déplacée dans Veille/{theme}/")
+
+    def _cmd_projects(self) -> None:
+        if not self._config.obsidian.enabled:
+            self._send_plain("Obsidian désactivé dans config.toml")
+            return
+        from guetteur.export.obsidian import ObsidianExporter
+
+        exporter = ObsidianExporter(self._config, self._store)
+        sheets = exporter.load_project_sheets()
+        if not sheets:
+            self._send_plain("Aucune fiche projet dans Projets/")
+            return
+        lines = ["Fiches projet chargées :"]
+        for s in sheets:
+            lines.append(f"• {s.slug} — {s.nom} ({s.statut})")
+        self._send_plain("\n".join(lines))
+
+    def _cmd_applicability(self, args: list[str]) -> None:
+        if not args:
+            self._send_plain("Usage : /applicabilite <video_id>")
+            return
+        if not self._config.applicability.enabled:
+            self._send_plain("applicability.enabled = false dans config.toml")
+            return
+        video_id = args[0]
+        record = self._store.get(video_id)
+        if record is None or record.summary is None:
+            self._send_plain(f"Vidéo {video_id} sans résumé en base.")
+            return
+        from guetteur.export.obsidian import ObsidianExporter
+        from guetteur.summarize.applicability import build_evaluator_from_summarizer
+        from guetteur.summarize.base import summary_from_json
+
+        exporter = ObsidianExporter(self._config, self._store)
+        exporter.ensure_vault_layout()
+        sheets = exporter.load_project_sheets()
+        if not sheets:
+            self._send_plain("Aucune fiche projet dans Projets/")
+            return
+        summary = summary_from_json(record.summary)
+        video = record.to_video()
+        evaluator = build_evaluator_from_summarizer(self._summarizer)
+        try:
+            with self._claude_lock:
+                pertinences = evaluator.evaluate(video, summary, sheets)
+        except Exception as exc:
+            self._send_plain(f"Applicabilité en échec : {type(exc).__name__}")
+            return
+        self._store.clear_applicability(video_id)
+        for p in pertinences:
+            self._store.upsert_applicability(
+                video_id,
+                p.projet,
+                p.score,
+                p.idee,
+                p.integration,
+                p.effort,
+                p.risques,
+                p.prompt_claude_code,
+            )
+            if p.is_actionable:
+                exporter.append_idea(
+                    video,
+                    p.projet,
+                    p.score,
+                    p.idee,
+                    p.integration,
+                    p.effort,
+                    p.prompt_claude_code,
+                )
+        best = [f"{p.projet}({p.score})" for p in pertinences if p.score >= 1]
+        self._send_plain(f"Applicabilité mise à jour : {', '.join(best) or 'aucune pertinence'}")
 
     def _help_text(self) -> str:
         return (

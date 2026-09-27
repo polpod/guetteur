@@ -116,6 +116,38 @@ CREATE TABLE IF NOT EXISTS qa (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_qa_video ON qa(video_id, id);
+-- Export Obsidian (Lot 6) : chemin de la note par vidéo (retrouvée même après
+-- déplacement Inbox → Veille/<thème> ou Veille/_ecartes), statut et thème pour les
+-- boutons Garder/Écarter, taxonomie corrigée par /theme.
+CREATE TABLE IF NOT EXISTS obsidian_notes (
+    video_id     TEXT PRIMARY KEY,
+    path         TEXT NOT NULL,
+    status       TEXT NOT NULL DEFAULT 'inbox',
+    theme        TEXT NOT NULL DEFAULT '',
+    updated_at   TEXT NOT NULL
+);
+-- Applicabilité aux projets (Lot 6) : score et méga-prompt par (video_id, projet).
+-- Cache pour éviter de rejouer la seconde passe Claude à chaque `guetteur applicability`.
+CREATE TABLE IF NOT EXISTS applicability (
+    video_id     TEXT NOT NULL,
+    project_slug TEXT NOT NULL,
+    score        INTEGER NOT NULL,
+    idea         TEXT NOT NULL DEFAULT '',
+    integration  TEXT NOT NULL DEFAULT '',
+    effort       TEXT NOT NULL DEFAULT '',
+    risks        TEXT NOT NULL DEFAULT '',
+    prompt       TEXT NOT NULL DEFAULT '',
+    created_at   TEXT NOT NULL,
+    PRIMARY KEY (video_id, project_slug)
+);
+-- Idempotence des append dans Projets/<slug>/IDEES.md (Lot 6) : une seule ligne
+-- écrite par couple (video_id, project_slug).
+CREATE TABLE IF NOT EXISTS ideas_written (
+    video_id     TEXT NOT NULL,
+    project_slug TEXT NOT NULL,
+    at           TEXT NOT NULL,
+    PRIMARY KEY (video_id, project_slug)
+);
 """
 )
 
@@ -619,6 +651,115 @@ class Store:
             (video_id, limit),
         ).fetchall()
         return [(str(r["question"]), str(r["answer"])) for r in reversed(rows)]
+
+    def all_qa(self, video_id: str) -> list[tuple[int, str, str, str]]:
+        """Tous les Q&A d'une vidéo dans l'ordre chronologique. Retourne (id, q, a, at)."""
+        rows = self._conn.execute(
+            "SELECT id, question, answer, created_at FROM qa WHERE video_id = ? ORDER BY id",
+            (video_id,),
+        ).fetchall()
+        return [
+            (int(r["id"]), str(r["question"]), str(r["answer"]), str(r["created_at"])) for r in rows
+        ]
+
+    # --- export Obsidian (Lot 6) -----------------------------------------------------------
+
+    def upsert_obsidian_note(
+        self, video_id: str, path: str, status: str = "inbox", theme: str = ""
+    ) -> None:
+        self._conn.execute(
+            "INSERT INTO obsidian_notes (video_id, path, status, theme, updated_at) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(video_id) DO UPDATE SET path = excluded.path, "
+            "status = excluded.status, theme = excluded.theme, "
+            "updated_at = excluded.updated_at",
+            (video_id, path, status, theme, _now()),
+        )
+
+    def obsidian_note(self, video_id: str) -> tuple[str, str, str] | None:
+        row = self._conn.execute(
+            "SELECT path, status, theme FROM obsidian_notes WHERE video_id = ?",
+            (video_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return str(row["path"]), str(row["status"]), str(row["theme"])
+
+    def pending_exports(self, limit: int = 1000) -> list[VideoRecord]:
+        """Vidéos réellement envoyées mais sans note Obsidian associée."""
+        rows = self._conn.execute(
+            "SELECT v.* FROM videos v LEFT JOIN obsidian_notes n ON v.video_id = n.video_id "
+            "WHERE v.status = ? AND v.sent_at IS NOT NULL AND n.video_id IS NULL "
+            "ORDER BY v.sent_at ASC LIMIT ?",
+            (Status.SENT.value, limit),
+        ).fetchall()
+        return [self._record(r) for r in rows]
+
+    # --- applicabilité (Lot 6) -------------------------------------------------------------
+
+    def upsert_applicability(
+        self,
+        video_id: str,
+        project_slug: str,
+        score: int,
+        idea: str,
+        integration: str,
+        effort: str,
+        risks: str,
+        prompt: str,
+    ) -> None:
+        self._conn.execute(
+            "INSERT INTO applicability (video_id, project_slug, score, idea, integration, "
+            "effort, risks, prompt, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(video_id, project_slug) DO UPDATE SET score = excluded.score, "
+            "idea = excluded.idea, integration = excluded.integration, "
+            "effort = excluded.effort, risks = excluded.risks, prompt = excluded.prompt, "
+            "created_at = excluded.created_at",
+            (video_id, project_slug, score, idea, integration, effort, risks, prompt, _now()),
+        )
+
+    def applicability_for(self, video_id: str) -> list[tuple[str, int, str, str, str, str, str]]:
+        rows = self._conn.execute(
+            "SELECT project_slug, score, idea, integration, effort, risks, prompt "
+            "FROM applicability WHERE video_id = ? ORDER BY score DESC, project_slug",
+            (video_id,),
+        ).fetchall()
+        return [
+            (
+                str(r["project_slug"]),
+                int(r["score"]),
+                str(r["idea"]),
+                str(r["integration"]),
+                str(r["effort"]),
+                str(r["risks"]),
+                str(r["prompt"]),
+            )
+            for r in rows
+        ]
+
+    def clear_applicability(self, video_id: str) -> None:
+        self._conn.execute("DELETE FROM applicability WHERE video_id = ?", (video_id,))
+        self._conn.execute("DELETE FROM ideas_written WHERE video_id = ?", (video_id,))
+
+    def mark_idea_written(self, video_id: str, project_slug: str) -> bool:
+        """Retourne True si c'est la première fois qu'on écrit cette idée dans IDEES.md."""
+        cur = self._conn.execute(
+            "INSERT OR IGNORE INTO ideas_written (video_id, project_slug, at) VALUES (?, ?, ?)",
+            (video_id, project_slug, _now()),
+        )
+        return cur.rowcount == 1
+
+    def pending_applicability(self, limit: int = 1000) -> list[VideoRecord]:
+        """Vidéos réellement envoyées avec résumé mais sans score d'applicabilité."""
+        rows = self._conn.execute(
+            "SELECT v.* FROM videos v "
+            "LEFT JOIN (SELECT DISTINCT video_id FROM applicability) a "
+            "ON v.video_id = a.video_id "
+            "WHERE v.status = ? AND v.sent_at IS NOT NULL AND v.summary IS NOT NULL "
+            "AND a.video_id IS NULL ORDER BY v.sent_at ASC LIMIT ?",
+            (Status.SENT.value, limit),
+        ).fetchall()
+        return [self._record(r) for r in rows]
 
     def _update(
         self,

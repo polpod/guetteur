@@ -394,6 +394,7 @@ class Pipeline:
                         if raw.isdigit():
                             self._store.link_message(int(raw), vid, kind="summary:auto")
                 self._maybe_archive(vid, video, summary, playlist.label)
+                self.maybe_export(video, summary)
                 return "sent"
             if last is not None:
                 kind = "passagère" if last.retryable else "définitive"
@@ -429,6 +430,85 @@ class Pipeline:
             if notify:
                 self._notify_no_transcript(record)
         return "failed"
+
+    # --- export Obsidian + applicabilité (Lot 6) ------------------------------------------
+
+    def maybe_export(self, video: Video, summary: Summary) -> None:
+        """Appelé après un envoi réussi si `[obsidian] enabled` OU `[applicability] enabled`.
+        Non bloquant : toute erreur reste en warning."""
+        if not self._config.obsidian.enabled and not self._config.applicability.enabled:
+            return
+        try:
+            from guetteur.export.obsidian import ObsidianExporter
+        except ImportError:
+            return
+        exporter: Any | None = None
+        pertinences: list[Any] = []
+        # 1. Applicabilité (si activée) — on scorer d'abord pour pouvoir écrire les
+        #    scores dans le frontmatter de la note.
+        if self._config.applicability.enabled:
+            try:
+                pertinences = self._evaluate_applicability(video, summary)
+            except Exception as exc:
+                log.warning(
+                    "applicability.failed",
+                    extra={"video_id": video.video_id, "error": f"{type(exc).__name__}: {exc}"},
+                )
+        # 2. Export Obsidian (si activé).
+        if self._config.obsidian.enabled:
+            try:
+                exporter = ObsidianExporter(self._config, self._store)
+                projets_scores = [(p.projet, p.score, p.idee) for p in pertinences]
+                exporter.export_note(
+                    video=video,
+                    summary=summary,
+                    detail=summary.detail,
+                    theme="",
+                    tags=[],
+                    tags_proposes=[],
+                    projets_scores=projets_scores,
+                )
+                for p in pertinences:
+                    if p.is_actionable:
+                        exporter.append_idea(
+                            video,
+                            p.projet,
+                            p.score,
+                            p.idee,
+                            p.integration,
+                            p.effort,
+                            p.prompt_claude_code,
+                        )
+            except Exception as exc:
+                log.warning(
+                    "obsidian.export_failed",
+                    extra={"video_id": video.video_id, "error": f"{type(exc).__name__}: {exc}"},
+                )
+
+    def _evaluate_applicability(self, video: Video, summary: Summary) -> list[Any]:
+        from guetteur.export.obsidian import ObsidianExporter
+        from guetteur.summarize.applicability import build_evaluator_from_summarizer
+
+        exporter = ObsidianExporter(self._config, self._store)
+        exporter.ensure_vault_layout()  # crée les fiches par défaut si absentes
+        sheets = exporter.load_project_sheets()
+        if not sheets:
+            return []
+        evaluator = build_evaluator_from_summarizer(self._summarizer)
+        with self._claude_lock:
+            pertinences = evaluator.evaluate(video, summary, sheets)
+        for p in pertinences:
+            self._store.upsert_applicability(
+                video.video_id,
+                p.projet,
+                p.score,
+                p.idee,
+                p.integration,
+                p.effort,
+                p.risques,
+                p.prompt_claude_code,
+            )
+        return pertinences
 
     # --- archivage (Lot 3) -----------------------------------------------------------------
 

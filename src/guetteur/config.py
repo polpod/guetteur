@@ -102,6 +102,36 @@ class TelegramConfig:
 
 
 @dataclass(frozen=True)
+class ObsidianConfig:
+    # Export vers un vault Obsidian (Lot 6). Le vault reçoit une note Markdown par
+    # vidéo dans `Veille/Inbox/`, plus des fiches projet dans `Projets/<slug>.md`.
+    enabled: bool = False
+    # Chemin absolu du vault (contenant `.obsidian/`). Refusé s'il est inclus dans
+    # /opt/guetteur/data/nlm ou dans /home/<user> pour ne jamais mélanger les
+    # secrets d'auth (audit §8.4).
+    path: Path = field(default_factory=lambda: Path("/opt/guetteur/vault"))
+    # Sync git après chaque écriture. Le remote peut être injoignable ; dans ce
+    # cas GUETTEUR fait un commit local seulement et retentera au prochain export.
+    git_sync: bool = True
+    git_remote: str = ""
+    # Nom du dossier racine de la veille dans le vault (ne pas confondre avec `path`).
+    veille_dir: str = "Veille"
+    projets_dir: str = "Projets"
+
+
+@dataclass(frozen=True)
+class ApplicabilityConfig:
+    # Seconde passe Claude qui score chaque projet chargé face au résumé détaillé.
+    enabled: bool = True
+    # Timeout de la passe applicabilité (Claude). Plus court qu'un résumé complet.
+    timeout_s: float = 120.0
+    # Score minimal pour ajouter une entrée dans Projets/<slug>/IDEES.md.
+    idea_threshold: int = 2
+    # Score minimal pour la ligne « Pertinent pour » du message Telegram.
+    mention_threshold: int = 1
+
+
+@dataclass(frozen=True)
 class WhatsAppConfig:
     api_version: str = "v20.0"
     template_name: str = "hello_world"
@@ -145,6 +175,8 @@ class Config:
     whatsapp: WhatsAppConfig = field(default_factory=WhatsAppConfig)
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
     archive: ArchiveConfig = field(default_factory=ArchiveConfig)
+    obsidian: ObsidianConfig = field(default_factory=ObsidianConfig)
+    applicability: ApplicabilityConfig = field(default_factory=ApplicabilityConfig)
     secrets: Secrets = field(default_factory=Secrets)
 
     @property
@@ -271,6 +303,53 @@ def _parse_telegram(raw: dict[str, Any]) -> TelegramConfig:
     )
 
 
+def _parse_obsidian(raw: dict[str, Any]) -> ObsidianConfig:
+    default = ObsidianConfig()
+    path_raw = raw.get("path")
+    path = Path(str(path_raw)) if path_raw else default.path
+    if not path.is_absolute() and str(path) not in ("", "."):
+        raise ConfigError(f"obsidian.path doit être un chemin absolu (reçu : {path!r})")
+    # Sécurité : refuser un vault posé dans le home NotebookLM ou dans un dossier
+    # système qui contient déjà des identifiants (audit §8).
+    for forbidden in ("/opt/guetteur/data/nlm", "/root", "/etc"):
+        try:
+            path.resolve().relative_to(Path(forbidden))
+        except (ValueError, OSError):
+            continue
+        raise ConfigError(
+            f"obsidian.path ({path}) est sous {forbidden}, chemin interdit "
+            "(risque de mélange avec les secrets)."
+        )
+    return ObsidianConfig(
+        enabled=bool(raw.get("enabled", False)),
+        path=path,
+        git_sync=bool(raw.get("git_sync", default.git_sync)),
+        git_remote=str(raw.get("git_remote", "")),
+        veille_dir=str(raw.get("veille_dir", default.veille_dir)),
+        projets_dir=str(raw.get("projets_dir", default.projets_dir)),
+    )
+
+
+def _parse_applicability(raw: dict[str, Any]) -> ApplicabilityConfig:
+    default = ApplicabilityConfig()
+    timeout = raw.get("timeout_s", default.timeout_s)
+    if isinstance(timeout, bool) or not isinstance(timeout, int | float) or timeout <= 0:
+        raise ConfigError(
+            f"applicability.timeout_s doit être un nombre positif (reçu : {timeout!r})"
+        )
+    return ApplicabilityConfig(
+        enabled=bool(raw.get("enabled", default.enabled)),
+        timeout_s=float(timeout),
+        idea_threshold=_positive_int(
+            raw.get("idea_threshold", default.idea_threshold), "applicability.idea_threshold"
+        ),
+        mention_threshold=_positive_int(
+            raw.get("mention_threshold", default.mention_threshold),
+            "applicability.mention_threshold",
+        ),
+    )
+
+
 _SECTIONS = frozenset(
     {
         "general",
@@ -280,6 +359,8 @@ _SECTIONS = frozenset(
         "whatsapp",
         "telegram",
         "archive",
+        "obsidian",
+        "applicability",
         "playlists",
     }
 )
@@ -326,6 +407,8 @@ def parse_config(data: dict[str, Any], secrets: Secrets | None = None) -> Config
         ),
         telegram=_parse_telegram(data.get("telegram", {})),
         archive=_parse_archive(data.get("archive", {})),
+        obsidian=_parse_obsidian(data.get("obsidian", {})),
+        applicability=_parse_applicability(data.get("applicability", {})),
         secrets=secrets if secrets is not None else Secrets.from_env(),
     )
 

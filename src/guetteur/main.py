@@ -450,6 +450,155 @@ def _parse_detail_filter(raw: str | None) -> tuple[DetailLevel, ...]:
     return tuple(seen) or DETAIL_LEVELS
 
 
+def cmd_export(config: Config, video_id: str | None, pending: bool) -> int:
+    """`guetteur export` : écrit la note Obsidian pour une vidéo (ou pour toutes les
+    vidéos `sent` sans note). Idempotent. Ne modifie ni le statut ni l'archivage."""
+    from guetteur.export.obsidian import ObsidianExporter
+    from guetteur.summarize.base import summary_from_json
+
+    if not config.obsidian.enabled:
+        print("❌ obsidian.enabled = false dans config.toml", file=sys.stderr)
+        return 1
+
+    store = Store(config.db_path)
+    try:
+        if video_id is not None:
+            record = store.get(video_id)
+            if record is None:
+                print(f"❌ Vidéo inconnue : {video_id}", file=sys.stderr)
+                return 1
+            records = [record]
+        elif pending:
+            records = store.pending_exports(limit=1000)
+            if not records:
+                print("→ Aucune vidéo sent sans note Obsidian.")
+                return 0
+        else:
+            print("❌ précisez --video-id ou --pending", file=sys.stderr)
+            return 2
+
+        exporter = ObsidianExporter(config, store)
+        exporter.ensure_vault_layout()
+        successes = 0
+        failures = 0
+        for rec in records:
+            if rec.summary is None:
+                print(
+                    f"⚠️  {rec.video_id} : résumé absent, ignorée",
+                    file=sys.stderr,
+                )
+                failures += 1
+                continue
+            video = rec.to_video()
+            summary = summary_from_json(rec.summary)
+            scores = store.applicability_for(rec.video_id)
+            projets_scores = [(slug, score, idea) for slug, score, idea, *_ in scores]
+            try:
+                result = exporter.export_note(
+                    video=video,
+                    summary=summary,
+                    detail=summary.detail,
+                    theme="",
+                    tags=[],
+                    tags_proposes=[],
+                    projets_scores=projets_scores,
+                )
+            except Exception as exc:
+                print(f"❌ {rec.video_id} : {exc}", file=sys.stderr)
+                failures += 1
+                continue
+            print(f"✅ {rec.video_id} → {result.path}")
+            successes += 1
+            # Applicabilité idempotente si présente en base.
+            for slug, score, idea, integration, effort, _risks, prompt in scores:
+                if score >= config.applicability.idea_threshold and prompt:
+                    exporter.append_idea(video, slug, score, idea, integration, effort, prompt)
+        print(f"\nTotal : {successes} exportée(s), {failures} en échec")
+        return 0 if failures == 0 else 1
+    finally:
+        store.close()
+
+
+def cmd_applicability(config: Config, video_id: str | None, pending: bool) -> int:
+    """`guetteur applicability` : relance la seconde passe Claude pour une vidéo (ou
+    pour toutes les `sent` sans score)."""
+    from guetteur.export.obsidian import ObsidianExporter
+    from guetteur.summarize import build_summarizer
+    from guetteur.summarize.applicability import build_evaluator_from_summarizer
+    from guetteur.summarize.base import summary_from_json
+
+    if not config.applicability.enabled:
+        print("❌ applicability.enabled = false dans config.toml", file=sys.stderr)
+        return 1
+
+    store = Store(config.db_path)
+    try:
+        if video_id is not None:
+            record = store.get(video_id)
+            if record is None:
+                print(f"❌ Vidéo inconnue : {video_id}", file=sys.stderr)
+                return 1
+            records = [record]
+        elif pending:
+            records = store.pending_applicability(limit=1000)
+            if not records:
+                print("→ Aucune vidéo sent sans applicabilité en attente.")
+                return 0
+        else:
+            print("❌ précisez --video-id ou --pending", file=sys.stderr)
+            return 2
+
+        exporter = ObsidianExporter(config, store)
+        exporter.ensure_vault_layout()
+        sheets = exporter.load_project_sheets()
+        if not sheets:
+            print("❌ Aucune fiche projet trouvée dans Projets/", file=sys.stderr)
+            return 1
+        summarizer = build_summarizer(config)
+        evaluator = build_evaluator_from_summarizer(summarizer)
+        successes = 0
+        for rec in records:
+            if rec.summary is None:
+                continue
+            video = rec.to_video()
+            summary = summary_from_json(rec.summary)
+            try:
+                pertinences = evaluator.evaluate(video, summary, sheets)
+            except Exception as exc:
+                print(f"❌ {rec.video_id} : {exc}", file=sys.stderr)
+                continue
+            store.clear_applicability(rec.video_id)
+            for p in pertinences:
+                store.upsert_applicability(
+                    rec.video_id,
+                    p.projet,
+                    p.score,
+                    p.idee,
+                    p.integration,
+                    p.effort,
+                    p.risques,
+                    p.prompt_claude_code,
+                )
+                if p.is_actionable:
+                    exporter.append_idea(
+                        video,
+                        p.projet,
+                        p.score,
+                        p.idee,
+                        p.integration,
+                        p.effort,
+                        p.prompt_claude_code,
+                    )
+            best = [(p.projet, p.score) for p in pertinences if p.score >= 1]
+            hint = ", ".join(f"{s}({sc})" for s, sc in best) or "aucune pertinence"
+            print(f"✅ {rec.video_id} → {hint}")
+            successes += 1
+        print(f"\nTotal : {successes} évaluée(s)")
+        return 0
+    finally:
+        store.close()
+
+
 def cmd_compare(
     config: Config,
     video_id: str,
@@ -652,6 +801,19 @@ def build_parser() -> argparse.ArgumentParser:
     ar_target.add_argument(
         "--pending", action="store_true", help="toutes les vidéos « sent » sans archived_at"
     )
+    ex = sub.add_parser(
+        "export", help="écrit la note Obsidian d'une vidéo (ou de toutes les sent sans note)"
+    )
+    ex_target = ex.add_mutually_exclusive_group(required=True)
+    ex_target.add_argument("--video-id")
+    ex_target.add_argument("--pending", action="store_true")
+    ap = sub.add_parser(
+        "applicability",
+        help="score chaque projet chargé face au résumé (une vidéo ou toutes les sent)",
+    )
+    ap_target = ap.add_mutually_exclusive_group(required=True)
+    ap_target.add_argument("--video-id")
+    ap_target.add_argument("--pending", action="store_true")
     tn = sub.add_parser("test-notify", help="envoie un message de test")
     tn.add_argument("--channel", choices=["telegram", "whatsapp"], default=None)
     sub.add_parser("doctor", help="vérifie claude, ffmpeg, la base et les jetons")
@@ -689,6 +851,10 @@ def cli(argv: Sequence[str] | None = None) -> int:
                 return cmd_health(config, args.alert)
             case "archive":
                 return cmd_archive(config, args.video_id, args.pending)
+            case "export":
+                return cmd_export(config, args.video_id, args.pending)
+            case "applicability":
+                return cmd_applicability(config, args.video_id, args.pending)
             case "compare":
                 return cmd_compare(config, args.video_id, args.channel, args.detail)
             case "test-notify":
