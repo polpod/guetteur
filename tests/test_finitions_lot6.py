@@ -363,3 +363,71 @@ def test_cmd_ideas_requires_project_arg(tmp_path: Path) -> None:
     bot, api = _bot_with_vault(tmp_path, ideas_content="# Idées\n")
     bot.handle_update({"message": {"chat": {"id": 42}, "text": "/idees"}})
     assert any("Usage" in m["text"] for m in api.messages_sent)
+
+
+# --- sécurité : path traversal via /idees et /theme -----------------------------------
+
+
+@pytest.mark.parametrize(
+    "malicious_slug",
+    [
+        "../secret",
+        "..%2Fsecret",  # regex refuse même l'échappement URL
+        "/etc/passwd",
+        "coder/../../../etc",
+        "coder\\..\\etc",
+        ".",
+        "..",
+        "-etc",  # préfixe piégeux
+        "a" * 100,  # trop long
+    ],
+)
+def test_cmd_ideas_refuses_malicious_slug(tmp_path: Path, malicious_slug: str) -> None:
+    """La commande /idees valide le slug avant de construire le chemin. Une entrée
+    tordue ne doit JAMAIS lire un fichier hors Projets/. On vérifie que le bot
+    répond « invalide » et n'appelle pas de read_text sur un autre chemin."""
+    bot, api = _bot_with_vault(tmp_path, ideas_content="# Idées\n")
+    # On crée un fichier « secret » à un endroit auquel le path traversal pourrait
+    # pointer, pour être sûr que le refus est bien avant la lecture.
+    secret = tmp_path / "secret"
+    secret.write_text("SECRET GUETTEUR\n", encoding="utf-8")
+    bot.handle_update({"message": {"chat": {"id": 42}, "text": f"/idees {malicious_slug}"}})
+    text = "\n".join(m["text"] for m in api.messages_sent)
+    assert "invalide" in text.lower()
+    assert "SECRET GUETTEUR" not in text
+
+
+def test_cmd_ideas_accepts_valid_slugs(tmp_path: Path) -> None:
+    """Les slugs conformes (lettres minuscules + `-`/`_`) passent."""
+    bot, api = _bot_with_vault(tmp_path, ideas_content="# Idées\n\n## 2026-01-01 — X\ncontenu\n")
+    bot.handle_update({"message": {"chat": {"id": 42}, "text": "/idees coder"}})
+    text = "\n".join(m["text"] for m in api.messages_sent)
+    assert "contenu" in text
+
+
+def test_move_to_theme_refuses_path_traversal(tmp_path: Path) -> None:
+    """Le thème passé à `move_to_theme` doit être un composant simple. Un thème
+    tordu (« ../secret », séparateur…) doit lever ObsidianExportError et NE PAS
+    créer/déplacer de fichier hors du vault."""
+    from guetteur.export.obsidian import ObsidianExporter, ObsidianExportError
+
+    config = _vault(tmp_path)  # sans git
+    store = Store(tmp_path / "guetteur.db")
+    try:
+        exporter = ObsidianExporter(config, store)
+        exporter.ensure_vault_layout()
+        exporter.export_note(
+            video=_video(datetime(2026, 2, 15, tzinfo=UTC)),
+            summary=_summary(),
+            detail="standard",
+            theme="",
+            tags=[],
+            tags_proposes=[],
+        )
+        for bad in ("../secret", "coder/../..", "a/b", "/tmp/attack", "..", ".", "\\evil"):
+            with pytest.raises(ObsidianExportError):
+                exporter.move_to_theme("VID_1", bad)
+        # Le fichier « secret » adjacent au vault n'a pas bougé et rien n'a été créé.
+        assert not (tmp_path / "secret").exists()
+    finally:
+        store.close()

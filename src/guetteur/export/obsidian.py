@@ -71,6 +71,22 @@ def _now_iso() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
 
 
+def _is_safe_component(name: str) -> bool:
+    """Vrai si `name` peut être utilisé comme composant de chemin sans risque de
+    traversée : rien de vide, pas de séparateur (`/`, `\\`), pas de `..`, pas de
+    `.` seul, pas de préfixe absolu, longueur raisonnable. Le vide est admis pour
+    laisser passer les appels internes (`theme=""` → fallback ECARTES_DIR)."""
+    if name == "":
+        return True
+    if len(name) > 128:
+        return False
+    if any(c in name for c in ("/", "\\", "\x00")):
+        return False
+    if name in (".", ".."):
+        return False
+    return not name.startswith(("~", "-", "."))
+
+
 # --- Taxonomy --------------------------------------------------------------------------
 
 
@@ -677,11 +693,25 @@ class ObsidianExporter:
         source = Path(existing[0])
         if not source.exists():
             return None
+        # Sécurité (Lot 6 finitions) : le thème vient d'une entrée utilisateur ; on
+        # refuse tout composant qui ferait sortir du dossier Veille (« ../secret »,
+        # séparateur exotique, chemin absolu…).
+        if not _is_safe_component(theme):
+            raise ObsidianExportError(
+                f"Thème invalide : {theme!r} (composants de chemin interdits)"
+            )
         # Rewrite frontmatter statut/theme dans le fichier avant déplacement.
         text = source.read_text(encoding="utf-8")
         new_text = _update_frontmatter_status(text, target_status, theme)
-        # Déplacement effectif.
+        # Déplacement effectif — la vérification résolue reste sous _veille.
         target_dir = self._veille / (theme or ECARTES_DIR)
+        veille_resolved = self._veille.resolve()
+        try:
+            target_resolved = target_dir.resolve()
+        except OSError as exc:
+            raise ObsidianExportError(f"Thème invalide : {theme!r} ({exc})") from exc
+        if veille_resolved != target_resolved and veille_resolved not in target_resolved.parents:
+            raise ObsidianExportError(f"Thème {theme!r} pointe hors du dossier Veille — refusé")
         target_dir.mkdir(parents=True, exist_ok=True)
         target = target_dir / source.name
         _atomic_write(target, new_text)

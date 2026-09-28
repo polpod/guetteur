@@ -40,6 +40,12 @@ META_UNKNOWN_LOG_PREFIX = "telegram_unknown_"  # dernier log d'un chat inconnu
 
 _BACKOFF_S = (5.0, 30.0, 60.0)  # backoff progressif après une exception
 
+# Slugs de projet acceptés par `/idees <projet>` : minuscules ASCII + `-`/`_`, ≤ 64.
+# Commence obligatoirement par une lettre ou un chiffre (pas de préfixe `-` piégeux,
+# pas de `.` menant à un dossier caché ou à `..`). Correspond au format généré par
+# `slugify_title` côté export Obsidian.
+_VALID_PROJECT_SLUG = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
+
 
 # --- API bas niveau Telegram ----------------------------------------------------------
 
@@ -701,7 +707,12 @@ class TelegramBot:
     def _cmd_ideas(self, args: list[str]) -> None:
         """`/idees <projet>` : renvoie les 5 dernières entrées de Projets/<projet>/IDEES.md.
         Chaque bloc commence par « ## <date> » ; on prend les 5 plus récents (à la fin
-        du fichier) et on les envoie en texte brut (méga-prompts inclus)."""
+        du fichier) et on les envoie en texte brut (méga-prompts inclus).
+
+        Le `slug` reçu de Telegram est traité comme entrée non fiable même si le bot
+        filtre déjà par chat_id : validation stricte par regex, puis vérification que
+        le chemin résolu reste bien sous `projets_dir` (défense contre `../../secret`,
+        les liens symboliques, ou les caractères de séparation de chemin exotiques)."""
         if not args:
             self._send_plain("Usage : /idees <projet>")
             return
@@ -709,9 +720,23 @@ class TelegramBot:
             self._send_plain("Obsidian désactivé dans config.toml")
             return
         slug = args[0].lower()
-        ideas_path = (
-            self._config.obsidian.path / self._config.obsidian.projets_dir / slug / "IDEES.md"
-        )
+        if not _VALID_PROJECT_SLUG.fullmatch(slug):
+            self._send_plain(
+                "Nom de projet invalide (autorisés : lettres minuscules, chiffres, '-', '_')."
+            )
+            return
+        projets_root = (self._config.obsidian.path / self._config.obsidian.projets_dir).resolve()
+        ideas_path = projets_root / slug / "IDEES.md"
+        # Défense en profondeur : le chemin résolu doit rester sous projets_root
+        # (bloque les symlinks pointant hors du vault).
+        try:
+            resolved = ideas_path.resolve()
+        except OSError:
+            self._send_plain("Nom de projet invalide.")
+            return
+        if projets_root not in resolved.parents:
+            self._send_plain("Nom de projet invalide.")
+            return
         if not ideas_path.exists():
             self._send_plain(f"Aucune idée pour « {slug} » (fichier absent).")
             return
@@ -748,10 +773,14 @@ class TelegramBot:
         if not self._config.obsidian.enabled:
             self._send_plain("Obsidian désactivé dans config.toml")
             return
-        from guetteur.export.obsidian import ObsidianExporter
+        from guetteur.export.obsidian import ObsidianExporter, ObsidianExportError
 
         exporter = ObsidianExporter(self._config, self._store)
-        target = exporter.move_to_theme(video_id, theme)
+        try:
+            target = exporter.move_to_theme(video_id, theme)
+        except ObsidianExportError as exc:
+            self._send_plain(f"Nom de thème invalide : {exc}")
+            return
         if target is None:
             self._send_plain(f"Aucune note Obsidian pour {video_id}")
             return
