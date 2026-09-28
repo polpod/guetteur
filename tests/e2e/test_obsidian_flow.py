@@ -140,13 +140,21 @@ def test_obsidian_flow_pipeline_then_keep_then_question_then_idea(tmp_path: Path
     assert "PROMPT CODER" in ideas
     assert NEW[0] in ideas or "Résumé standard" in ideas or "coder" in ideas
 
-    # === 3. Le commit local + push a été fait.
-    # Un dépôt bare a maintenant au moins un ref.
+    # === 3. Finitions Lot 6 §1 : UN SEUL commit git pour cette vidéo, avec le
+    # suffixe qui liste les projets où une idée a été ajoutée. `git log HEAD` sur
+    # un dépôt bare regarde la HEAD symbolique par défaut du remote.
     log = subprocess.run(
-        ["git", "log", "--oneline", "-1"], cwd=str(remote), capture_output=True, text=True
+        ["git", "log", "--pretty=%s", "HEAD"],
+        cwd=str(remote),
+        capture_output=True,
+        text=True,
     )
     assert log.returncode == 0
-    assert "GUETTEUR" in log.stdout
+    commits = [line for line in log.stdout.strip().splitlines() if line.startswith("GUETTEUR")]
+    assert len(commits) == 1, f"Attendu 1 commit GUETTEUR, obtenu {len(commits)} : {commits}"
+    assert "(+ idées : coder)" in commits[0], (
+        f"Le message de commit ne liste pas les projets : {commits[0]!r}"
+    )
 
     # === 4. Fake bot : appui sur « Garder » → déplacement vers Veille/<thème>.
     # Comme aucun thème n'est encore posé, le bouton « Garder » enverra vers « Inbox » par

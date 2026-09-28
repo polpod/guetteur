@@ -86,9 +86,22 @@ def build_message(
     video: Video,
     label: str,
     reply_markup: dict[str, Any] | None = None,
+    pertinences: list[tuple[str, int]] | None = None,
 ) -> Message:
     md_raw = render_markdown_v2(summary, video, label)
     plain_raw = render_plain(summary, video, label)
+    # Finitions Lot 6 §4 : ligne « Pertinent pour : CODER (3), EAGLE (2) » ajoutée en
+    # fin de rendu quand des projets sont pertinents. Le clavier inline (Lot 6) porte
+    # les boutons cliquables correspondants (« Idée pour CODER »).
+    if pertinences:
+        from guetteur.summarize.format import escape_md_v2
+
+        listed = ", ".join(
+            f"*{escape_md_v2(slug.upper())}* \\({score}\\)" for slug, score in pertinences
+        )
+        md_raw = f"{md_raw}\n\n{escape_md_v2('Pertinent pour :')} {listed}"
+        plain_listed = ", ".join(f"{slug.upper()} ({score})" for slug, score in pertinences)
+        plain_raw = f"{plain_raw}\n\nPertinent pour : {plain_listed}"
     md_parts = numbered(split_markdown_v2_parts(md_raw, TELEGRAM_LIMIT), escape=True)
     plain_parts = numbered(split_plain_parts(plain_raw, WHATSAPP_LIMIT), escape=False)
     # Pour la rétrocompatibilité on remplit toujours markdown_v2/plain avec la string
@@ -299,17 +312,55 @@ class Pipeline:
         # Cache multi-niveaux du Lot 5 : le résumé fraîchement généré est enregistré
         # sous son niveau. Les boutons du bot peuvent le servir sans rappeler Claude.
         self._store.cache_summary(vid, summary.detail, summary_to_json(summary))
-        reply_markup = self._reply_markup_for(playlist, vid, summary.detail)
+        # Finitions Lot 6 §4 : on score l'applicabilité AVANT l'envoi Telegram, ce qui
+        # permet à `build_message` d'ajouter la ligne « Pertinent pour : … » et au
+        # clavier inline d'exposer un bouton « Idée pour <PROJET> » par projet score ≥ 2.
+        pertinences = self._score_applicability_if_enabled(video, summary)
+        mention_threshold = self._config.applicability.mention_threshold
+        idea_threshold = self._config.applicability.idea_threshold
+        mentions = [(p.projet, p.score) for p in pertinences if p.score >= mention_threshold]
+        actionable_slugs = [
+            p.projet for p in pertinences if p.score >= idea_threshold and p.prompt_claude_code
+        ]
+        reply_markup = self._reply_markup_for(playlist, vid, summary.detail, actionable_slugs)
         return self._deliver(
             vid,
             playlist,
             video,
             summary,
-            build_message(summary, video, playlist.label, reply_markup=reply_markup),
+            build_message(
+                summary,
+                video,
+                playlist.label,
+                reply_markup=reply_markup,
+                pertinences=mentions or None,
+            ),
         )
 
+    def _score_applicability_if_enabled(self, video: Video, summary: Summary) -> list[Any]:
+        """Score l'applicabilité APRÈS le résumé, AVANT l'envoi Telegram. Les scores
+        sont persistés dans la table `applicability` pour être servis au bot (bouton
+        « Idée pour <PROJET> ») et au commit git final regroupé."""
+        if not self._config.applicability.enabled:
+            return []
+        try:
+            return self._evaluate_applicability(video, summary)
+        except Exception as exc:
+            log.warning(
+                "applicability.failed",
+                extra={
+                    "video_id": video.video_id,
+                    "error": f"{type(exc).__name__}: {exc}",
+                },
+            )
+            return []
+
     def _reply_markup_for(
-        self, playlist: PlaylistConfig, video_id: str, detail: DetailLevel
+        self,
+        playlist: PlaylistConfig,
+        video_id: str,
+        detail: DetailLevel,
+        project_slugs: list[str] | None = None,
     ) -> dict[str, Any] | None:
         """Boutons inline sous le résumé quand le bot Telegram est actif et que la
         playlist envoie sur Telegram. Rien sur WhatsApp (l'API ne gère pas ce clavier)."""
@@ -319,7 +370,7 @@ class Pipeline:
         # n'est pas utilisé (tests, provider WhatsApp uniquement…).
         from guetteur.notify.telegram_bot import build_summary_keyboard
 
-        return build_summary_keyboard(video_id, detail)
+        return build_summary_keyboard(video_id, detail, project_slugs=project_slugs or [])
 
     # --- envoi -----------------------------------------------------------------------------
 
@@ -434,56 +485,32 @@ class Pipeline:
     # --- export Obsidian + applicabilité (Lot 6) ------------------------------------------
 
     def maybe_export(self, video: Video, summary: Summary) -> None:
-        """Appelé après un envoi réussi si `[obsidian] enabled` OU `[applicability] enabled`.
-        Non bloquant : toute erreur reste en warning."""
-        if not self._config.obsidian.enabled and not self._config.applicability.enabled:
+        """Après un envoi réussi : écrit la note Obsidian + idées en UN SEUL commit git
+        (finitions Lot 6 §1). Les pertinences ont déjà été scorées avant l'envoi
+        (dans `_score_applicability_if_enabled`) et sont lues depuis la base."""
+        if not self._config.obsidian.enabled:
             return
         try:
             from guetteur.export.obsidian import ObsidianExporter
         except ImportError:
             return
-        exporter: Any | None = None
-        pertinences: list[Any] = []
-        # 1. Applicabilité (si activée) — on scorer d'abord pour pouvoir écrire les
-        #    scores dans le frontmatter de la note.
-        if self._config.applicability.enabled:
-            try:
-                pertinences = self._evaluate_applicability(video, summary)
-            except Exception as exc:
-                log.warning(
-                    "applicability.failed",
-                    extra={"video_id": video.video_id, "error": f"{type(exc).__name__}: {exc}"},
-                )
-        # 2. Export Obsidian (si activé).
-        if self._config.obsidian.enabled:
-            try:
-                exporter = ObsidianExporter(self._config, self._store)
-                projets_scores = [(p.projet, p.score, p.idee) for p in pertinences]
-                exporter.export_note(
-                    video=video,
-                    summary=summary,
-                    detail=summary.detail,
-                    theme="",
-                    tags=[],
-                    tags_proposes=[],
-                    projets_scores=projets_scores,
-                )
-                for p in pertinences:
-                    if p.is_actionable:
-                        exporter.append_idea(
-                            video,
-                            p.projet,
-                            p.score,
-                            p.idee,
-                            p.integration,
-                            p.effort,
-                            p.prompt_claude_code,
-                        )
-            except Exception as exc:
-                log.warning(
-                    "obsidian.export_failed",
-                    extra={"video_id": video.video_id, "error": f"{type(exc).__name__}: {exc}"},
-                )
+        try:
+            exporter = ObsidianExporter(self._config, self._store)
+            pertinences = self._store.applicability_for(video.video_id)
+            exporter.export_video(
+                video=video,
+                summary=summary,
+                detail=summary.detail,
+                theme="",
+                tags=[],
+                tags_proposes=[],
+                pertinences=list(pertinences),
+            )
+        except Exception as exc:
+            log.warning(
+                "obsidian.export_failed",
+                extra={"video_id": video.video_id, "error": f"{type(exc).__name__}: {exc}"},
+            )
 
     def _evaluate_applicability(self, video: Video, summary: Summary) -> list[Any]:
         from guetteur.export.obsidian import ObsidianExporter

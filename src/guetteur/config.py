@@ -101,6 +101,9 @@ class TelegramConfig:
     qa_history_size: int = 6
 
 
+FilenameDate = Literal["publication", "traitement"]
+
+
 @dataclass(frozen=True)
 class ObsidianConfig:
     # Export vers un vault Obsidian (Lot 6). Le vault reçoit une note Markdown par
@@ -117,6 +120,9 @@ class ObsidianConfig:
     # Nom du dossier racine de la veille dans le vault (ne pas confondre avec `path`).
     veille_dir: str = "Veille"
     projets_dir: str = "Projets"
+    # Date utilisée dans le nom de fichier des notes (finitions Lot 6 §2) :
+    # « publication » = date de la vidéo YouTube, « traitement » = date d'export.
+    filename_date: FilenameDate = "publication"
 
 
 @dataclass(frozen=True)
@@ -303,6 +309,9 @@ def _parse_telegram(raw: dict[str, Any]) -> TelegramConfig:
     )
 
 
+_FILENAME_DATES: tuple[FilenameDate, ...] = ("publication", "traitement")
+
+
 def _parse_obsidian(raw: dict[str, Any]) -> ObsidianConfig:
     default = ObsidianConfig()
     path_raw = raw.get("path")
@@ -320,6 +329,17 @@ def _parse_obsidian(raw: dict[str, Any]) -> ObsidianConfig:
             f"obsidian.path ({path}) est sous {forbidden}, chemin interdit "
             "(risque de mélange avec les secrets)."
         )
+    filename_date_raw = str(raw.get("filename_date", default.filename_date))
+    if filename_date_raw not in _FILENAME_DATES:
+        raise ConfigError(
+            f"obsidian.filename_date doit valoir 'publication' ou 'traitement' "
+            f"(reçu : {filename_date_raw!r})"
+        )
+    # `filename_date_raw in _FILENAME_DATES` a rétréci le type ci-dessus, mais mypy
+    # ne le propage pas depuis une comparaison à un tuple ; assign narrow direct.
+    filename_date: FilenameDate = (
+        "traitement" if filename_date_raw == "traitement" else "publication"
+    )
     return ObsidianConfig(
         enabled=bool(raw.get("enabled", False)),
         path=path,
@@ -327,6 +347,7 @@ def _parse_obsidian(raw: dict[str, Any]) -> ObsidianConfig:
         git_remote=str(raw.get("git_remote", "")),
         veille_dir=str(raw.get("veille_dir", default.veille_dir)),
         projets_dir=str(raw.get("projets_dir", default.projets_dir)),
+        filename_date=filename_date,
     )
 
 

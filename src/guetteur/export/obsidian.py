@@ -24,6 +24,8 @@ import subprocess
 import tempfile
 import threading
 import unicodedata
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -147,6 +149,11 @@ class ProjectSheet:
     objectifs: tuple[str, ...] = ()
     recherche: tuple[str, ...] = ()
     exclusions: tuple[str, ...] = ()
+    # Finitions Lot 6 §3 : le dépôt du projet (chemin local ou URL git) et les modules
+    # clés au format « chemin/vers/fichier.py : rôle » ; injectés dans le prompt
+    # d'applicabilité pour que Claude cite ces chemins réels dans le méga-prompt.
+    depot: str = ""
+    modules_cles: tuple[str, ...] = ()
     body_extra: str = ""  # tout ce qui suit le frontmatter, pour contexte Claude
 
     def as_context(self) -> str:
@@ -154,12 +161,19 @@ class ProjectSheet:
         parts = [f"# {self.nom}", f"slug: {self.slug}", f"statut: {self.statut}"]
         if self.stack:
             parts.append("Stack : " + ", ".join(self.stack))
+        if self.depot:
+            parts.append(f"Dépôt : {self.depot}")
         if self.objectifs:
             parts.append("Objectifs :\n- " + "\n- ".join(self.objectifs))
         if self.recherche:
             parts.append("Sujets recherchés :\n- " + "\n- ".join(self.recherche))
         if self.exclusions:
             parts.append("Exclusions :\n- " + "\n- ".join(self.exclusions))
+        if self.modules_cles:
+            parts.append(
+                "Modules clés (seuls chemins autorisés dans les méga-prompts) :\n- "
+                + "\n- ".join(self.modules_cles)
+            )
         if self.body_extra.strip():
             parts.append("Notes libres :\n" + self.body_extra.strip())
         return "\n".join(parts)
@@ -177,6 +191,8 @@ def parse_project_sheet(slug: str, text: str) -> ProjectSheet:
         objectifs=_seq(front.get("objectifs")),
         recherche=_seq(front.get("recherche")),
         exclusions=_seq(front.get("exclusions")),
+        depot=str(front.get("depot", "")),
+        modules_cles=_seq(front.get("modules_cles")),
         body_extra=body,
     )
 
@@ -461,6 +477,9 @@ class ObsidianExporter:
         self._veille: Path = config.obsidian.path / config.obsidian.veille_dir
         self._projets: Path = config.obsidian.path / config.obsidian.projets_dir
         self._inbox: Path = self._veille / "Inbox"
+        # Finitions Lot 6 §1 : quand ce drapeau est actif, `_commit` ne pousse pas de
+        # commit intermédiaire. `export_video()` groupe note + idées en un seul commit.
+        self._defer_commit: bool = False
 
     # --- vault init -------------------------------------------------------------------
 
@@ -479,6 +498,71 @@ class ObsidianExporter:
             sheet_path = self._projets / f"{slug}.md"
             if not sheet_path.exists():
                 _atomic_write(sheet_path, sheet_text)
+
+    # --- commit groupé (finitions Lot 6 §1) ------------------------------------------
+
+    @contextmanager
+    def batch_commit(self, message: str) -> Iterator[None]:
+        """Regroupe les écritures qui suivent en un seul commit git. Toutes les
+        méthodes `export_note`, `move_to_*`, `append_idea` appelées dans ce bloc ne
+        commiteront pas individuellement ; un unique `_commit(message)` est fait en
+        sortie. Sûr en cas d'exception : le commit final est skip dans ce cas."""
+        previous = self._defer_commit
+        self._defer_commit = True
+        raised = False
+        try:
+            yield
+        except Exception:
+            raised = True
+            raise
+        finally:
+            self._defer_commit = previous
+            if not previous and not raised:
+                self._commit(message)
+
+    def export_video(
+        self,
+        video: Video,
+        summary: Summary,
+        detail: DetailLevel,
+        theme: str,
+        tags: list[str],
+        tags_proposes: list[str],
+        pertinences: list[tuple[str, int, str, str, str, str, str]] | None = None,
+        archive_notebooklm: str | None = None,
+    ) -> NoteWriteResult:
+        """Écrit la note ET tous les blocs d'idées score ≥ idea_threshold en un
+        SEUL commit git avec un message qui liste les projets ajoutés.
+
+        `pertinences` : liste (slug, score, idée, integration, effort, risques, prompt)
+        déjà scorée et en base — `Pipeline.maybe_export` la construit depuis
+        `applicability_for`. Aucun appel Claude effectué ici."""
+        pertinences = pertinences or []
+        actionable: list[str] = []
+        threshold = self._config.applicability.idea_threshold
+        previous_defer = self._defer_commit
+        self._defer_commit = True
+        try:
+            result = self.export_note(
+                video=video,
+                summary=summary,
+                detail=detail,
+                theme=theme,
+                tags=tags,
+                tags_proposes=tags_proposes,
+                projets_scores=[(slug, score, idea) for slug, score, idea, *_ in pertinences],
+                archive_notebooklm=archive_notebooklm,
+            )
+            for slug, score, idea, integration, effort, _risks, prompt in pertinences:
+                if score < threshold or not prompt:
+                    continue
+                if self.append_idea(video, slug, score, idea, integration, effort, prompt):
+                    actionable.append(slug)
+        finally:
+            self._defer_commit = previous_defer
+        suffix = f" (+ idées : {', '.join(actionable)})" if actionable else ""
+        self._commit(f"GUETTEUR : {video.title[:80]}{suffix}")
+        return result
 
     # --- projets ---------------------------------------------------------------------
 
@@ -555,9 +639,14 @@ class ObsidianExporter:
             p = Path(existing[0])
             if p.exists():
                 return p
-        published = (video.published or datetime.now(UTC)).astimezone(UTC).strftime("%Y-%m-%d")
+        # Finitions Lot 6 §2 : le préfixe est la date de publication de la vidéo ou
+        # la date de traitement (aujourd'hui), au choix de l'utilisateur.
+        if self._config.obsidian.filename_date == "traitement" or video.published is None:
+            date = datetime.now(UTC).strftime("%Y-%m-%d")
+        else:
+            date = video.published.astimezone(UTC).strftime("%Y-%m-%d")
         slug = slugify_title(video.title)
-        filename = f"{published} - {slug}.md"
+        filename = f"{date} - {slug}.md"
         if status == "garde" and theme:
             return self._veille / theme / filename
         if status == "ecarte":
@@ -663,6 +752,11 @@ class ObsidianExporter:
     # --- git ------------------------------------------------------------------------
 
     def _commit(self, message: str) -> str:
+        # Finitions Lot 6 §1 : quand `_defer_commit` est actif (export_video ou
+        # batch_commit), les mutations intermédiaires ne poussent pas de commit ;
+        # un unique commit est fait à la sortie du bloc.
+        if self._defer_commit:
+            return "deferred"
         if not self._config.obsidian.git_sync:
             return "disabled"
         try:

@@ -693,7 +693,52 @@ class TelegramBot:
         if cmd == "/applicabilite":
             self._cmd_applicability(args)
             return
+        if cmd == "/idees":
+            self._cmd_ideas(args)
+            return
         self._send_plain(f"Commande inconnue : {cmd}. /help pour la liste.")
+
+    def _cmd_ideas(self, args: list[str]) -> None:
+        """`/idees <projet>` : renvoie les 5 dernières entrées de Projets/<projet>/IDEES.md.
+        Chaque bloc commence par « ## <date> » ; on prend les 5 plus récents (à la fin
+        du fichier) et on les envoie en texte brut (méga-prompts inclus)."""
+        if not args:
+            self._send_plain("Usage : /idees <projet>")
+            return
+        if not self._config.obsidian.enabled:
+            self._send_plain("Obsidian désactivé dans config.toml")
+            return
+        slug = args[0].lower()
+        ideas_path = (
+            self._config.obsidian.path / self._config.obsidian.projets_dir / slug / "IDEES.md"
+        )
+        if not ideas_path.exists():
+            self._send_plain(f"Aucune idée pour « {slug} » (fichier absent).")
+            return
+        try:
+            text = ideas_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            self._send_plain(f"Lecture impossible : {exc}")
+            return
+        # Découpe sur les frontières « \n## » (chaque entrée commence par « ## <date> »).
+        blocks = [b.strip() for b in text.split("\n## ") if b.strip()]
+        if not blocks:
+            self._send_plain(f"IDEES.md de « {slug} » est vide.")
+            return
+        # Le premier bloc contient le « # Idées » d'en-tête ; on le drop s'il n'a pas
+        # de date. Les autres commencent par « <date> — <lien> ».
+        entries = [b for b in blocks if b[:4].isdigit()]
+        last5 = entries[-5:]
+        if not last5:
+            self._send_plain(f"IDEES.md de « {slug} » n'a pas encore d'entrée datée.")
+            return
+        header = f"Dernières idées pour {slug.upper()} :"
+        text_out = header + "\n\n## " + "\n\n## ".join(last5)
+        # Envoi en tranches ≤ 4000 caractères (texte brut copiable).
+        limit = 4000
+        while text_out:
+            self._send_plain(text_out[:limit])
+            text_out = text_out[limit:]
 
     def _cmd_theme(self, args: list[str]) -> None:
         if len(args) < 2:
@@ -792,6 +837,10 @@ class TelegramBot:
             "/retry <id> — remet une vidéo « failed » en file\n"
             "/reset <id> — retraitement complet\n"
             "/detail <id> <bref|standard|detaille> — génère un niveau\n"
+            "/theme <id> <thème> — déplace la note dans Veille/<thème>/\n"
+            "/projets — liste les fiches projet chargées\n"
+            "/applicabilite <id> — relance la seconde passe Claude\n"
+            "/idees <projet> — 5 dernières entrées de Projets/<projet>/IDEES.md\n"
             "/help — cette aide\n\n"
             "Réponds à n'importe quel message de résumé pour poser une question sur la vidéo, "
             "ou utilise le bouton « Question »."
