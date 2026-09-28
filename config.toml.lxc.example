@@ -1,0 +1,70 @@
+# Configuration GUETTEUR — cible LXC Proxmox non privilégié (production).
+# À copier vers /opt/guetteur/config.toml puis à adapter. Les secrets vont dans
+# /opt/guetteur/.env, jamais ici.
+
+[general]
+poll_interval_seconds = 300
+claude_model = "claude-sonnet-4-6"
+max_videos_per_cycle = 3
+data_dir = "data"                  # relatif à /opt/guetteur (soit /opt/guetteur/data)
+log_level = "INFO"
+
+[transcript]
+languages = ["fr", "en"]
+whisper_enabled = false
+whisper_model = "small"
+max_retries = 3
+
+[summarize]
+provider = "claude_code"          # session interactive (claude auth login), pas de clé API
+claude_code_bin = "claude"
+timeout_s = 600
+
+[notify]
+fallback = "telegram"
+max_attempts = 3
+retry_delays_s = [2, 8, 30]
+sending_timeout_min = 10
+
+[telegram]
+interactive = true                # bot Telegram Q&A + boutons de re-résumé (Lot 5)
+poll_timeout_s = 50
+rate_limit_per_hour = 10
+question_ttl_min = 10
+qa_history_size = 6
+
+[archive]
+# Archivage NotebookLM (extra `notebooklm` installé par WITH_NOTEBOOKLM=1).
+enabled = true
+notebook_name = "Veille YouTube"
+account = "guetteur.veille@gmail.com"
+home = "/opt/guetteur/data/nlm"    # NOTEBOOKLM_HOME dédié, 0700, chown guetteur
+max_sources_per_notebook = 45
+pinned_version = "0.8.3"
+
+[obsidian]
+# Vault Obsidian versionné (Lot 6 + Lot déploiement). install-lxc.sh l'initialise
+# à /opt/guetteur/data/vault : clé ed25519 dédiée + deploy key GitHub en écriture.
+enabled = true
+path = "/opt/guetteur/data/vault"
+git_sync = true
+git_remote = "git@github.com:polpod/vault-veille.git"
+veille_dir = "Veille"
+projets_dir = "Projets"
+filename_date = "publication"
+
+[applicability]
+enabled = true
+timeout_s = 120
+idea_threshold = 2
+mention_threshold = 1
+
+# Une section [[playlists]] par playlist surveillée.
+
+[[playlists]]
+id = "PLNH7S2yTLTqA"
+label = "Résumé"
+language = "fr"
+notify = "telegram"
+private = false
+detail = "standard"

@@ -24,15 +24,16 @@ Chaque résumé contient :
 
 1. [Fonctionnement](#fonctionnement)
 2. [Installation dans un LXC Proxmox sans Docker (Claude Code)](#installation-dans-un-lxc-proxmox-sans-docker-claude-code)
-3. [Installation dans un LXC Proxmox avec Docker](#installation-dans-un-lxc-proxmox-debian-12)
-4. [Obtenir les jetons Telegram](#obtenir-les-jetons-telegram)
-5. [Obtenir les jetons WhatsApp (Meta Cloud API)](#obtenir-les-jetons-whatsapp-meta-cloud-api)
-6. [Mettre une playlist en « non répertoriée »](#mettre-une-playlist-en--non-répertoriée-)
-7. [Playlist privée : procédure OAuth](#playlist-privée--procédure-oauth)
-8. [Commandes](#commandes)
-9. [Configuration](#configuration)
-10. [Développement](#développement)
-11. [Limites connues](#limites-connues)
+3. [Déploiement complet (LXC + vault + pare-feu + durcissement)](#déploiement-complet-lxc--vault--pare-feu--durcissement)
+4. [Installation dans un LXC Proxmox avec Docker](#installation-dans-un-lxc-proxmox-debian-12)
+5. [Obtenir les jetons Telegram](#obtenir-les-jetons-telegram)
+6. [Obtenir les jetons WhatsApp (Meta Cloud API)](#obtenir-les-jetons-whatsapp-meta-cloud-api)
+7. [Mettre une playlist en « non répertoriée »](#mettre-une-playlist-en--non-répertoriée-)
+8. [Playlist privée : procédure OAuth](#playlist-privée--procédure-oauth)
+9. [Commandes](#commandes)
+10. [Configuration](#configuration)
+11. [Développement](#développement)
+12. [Limites connues](#limites-connues)
 
 ---
 
@@ -227,6 +228,175 @@ journalctl -u guetteur -f
 L'unité `deploy/guetteur.service` lance `uv run --no-sync guetteur run` sous l'utilisateur
 `guetteur`, avec `WorkingDirectory=/opt/guetteur`,
 `EnvironmentFile=/opt/guetteur/.env` et `Restart=always`.
+
+---
+
+## Déploiement complet (LXC + vault + pare-feu + durcissement)
+
+Séquence de bout en bout pour un déploiement production sur Proxmox. Chaque étape
+est **idempotente** : ré-exécuter le script n'endommage rien.
+
+### 1. Créer le conteneur et pousser le pare-feu (hôte Proxmox, root)
+
+```bash
+git clone https://github.com/polpod/guetteur.git /root/guetteur   # ou scp -r
+bash /root/guetteur/scripts/proxmox-create-lxc.sh 120 local-lvm vmbr0
+```
+
+Le script fait, dans l'ordre : création LXC non privilégié → attente réseau →
+`pct exec install-lxc.sh` → écriture de `/etc/pve/firewall/120.fw` avec :
+
+```
+policy_in : DROP    policy_out : DROP    log_level : info
+OUT ACCEPT udp/tcp 53  (DNS, EN PREMIER)
+OUT DROP   192.168.0.0/16, 10.0.0.0/8, 172.16.0.0/12  (LAN, journalisé)
+OUT ACCEPT tcp 443, 22, 80  +  icmp
+```
+
+**Important — sans ces trois cases cochées, le pare-feu ne s'applique pas :**
+
+1. Datacenter → Firewall → **Firewall = Yes** ;
+2. Nœud → Firewall → **Firewall = Yes** ;
+3. Conteneur 120 → Firewall → **Firewall = Yes**.
+
+**Avant** d'activer le firewall du datacenter, ouvrez au moins ces règles IN, sinon
+vous perdez l'accès à Proxmox et à SSH :
+
+```
+Datacenter → Firewall → Add :
+  Direction=in  Action=ACCEPT  Source=<LAN>/24  Dport=8006  # UI Proxmox
+  Direction=in  Action=ACCEPT  Source=<LAN>/24  Dport=22    # SSH hôte
+```
+
+### 2. Ajouter la deploy key du vault (dans le conteneur, prompt de install-lxc.sh)
+
+Pendant `install-lxc.sh`, une clé ed25519 est générée pour l'utilisateur `guetteur`
+et sa clé publique est affichée. Ajoutez-la sur GitHub :
+
+- `https://github.com/polpod/vault-veille/settings/keys/new`
+- **Title** : `guetteur (<hostname>)`  •  **Key** : la ligne `ssh-ed25519 …`
+- Cocher **Allow write access**.
+
+Appuyez sur `ENTRÉE` : le vault est cloné dans `/opt/guetteur/data/vault`
+(`user.name = GUETTEUR`, `user.email = guetteur@localhost` définis dans le clone
+uniquement, pas en global).
+
+Si vous relancez `install-lxc.sh` plus tard, la clé existe déjà et le prompt
+ne réapparaît pas.
+
+### 3. Pousser `.env` et le profil NotebookLM (depuis votre PC)
+
+```bash
+# .env : jetons Telegram uniquement (claude_code n'a pas besoin d'ANTHROPIC_API_KEY).
+scp .env root@<ip-lxc>:/root/.env
+pct exec 120 -- install -m 600 -o guetteur -g guetteur /root/.env /opt/guetteur/.env
+
+# Profil NotebookLM déjà connecté (facultatif, seulement si archive.enabled = true).
+scp -r ~/.guetteur-nlm/* root@<ip-lxc>:/opt/guetteur/data/nlm/
+pct exec 120 -- chown -R guetteur:guetteur /opt/guetteur/data/nlm
+pct exec 120 -- chmod 0700 /opt/guetteur/data/nlm
+```
+
+### 4. Connecter Claude Code (dans le conteneur, sous `guetteur`)
+
+```bash
+pct enter 120
+sudo -u guetteur -i claude auth login    # ouvre une URL, coller le code
+sudo -u guetteur -i claude auth status   # "loggedIn": true
+```
+
+### 5. `guetteur doctor` — toutes les lignes doivent être OK
+
+```bash
+guetteur doctor
+```
+
+Attendu :
+
+| Ligne | État | Détail |
+|---|---|---|
+| `backend de résumé` | OK | `claude_code (claude-sonnet-4-6)` |
+| `claude : binaire` / `session` | OK | ping du binaire |
+| `ffmpeg`, `base SQLite` | OK | |
+| `tokens Telegram` | OK | `TELEGRAM_BOT_TOKEN et TELEGRAM_CHAT_ID présents` |
+| `vault : remote joignable` | OK | `git@github.com:polpod/vault-veille.git (HEAD abc123def)` |
+| `notebooklm : version/permissions/session/compte` | OK | 4 lignes si `archive.enabled = true` |
+
+Si `vault : remote joignable` échoue, la clé publique n'a pas été ajoutée
+comme *deploy key* — voir étape 2.
+
+### 6. Activer les services et vérifier le pare-feu
+
+```bash
+pct exec 120 -- systemctl enable --now guetteur.service guetteur-health.timer
+pct exec 120 -- systemctl enable --now guetteur-nlm-refresh.timer   # si NotebookLM
+pct exec 120 -- systemctl status guetteur --no-pager
+```
+
+**Sur l'hôte Proxmox** (le pare-feu du conteneur doit être activé — étape 1) :
+
+```bash
+bash /root/guetteur/scripts/firewall-check.sh 120
+```
+
+Sortie attendue :
+
+```
+  OK   DNS → api.telegram.org                  (attendu OK)
+  OK   TCP → api.telegram.org:443              (attendu OK)
+  OK   TCP → github.com:22                     (attendu OK)
+  OK   ping → passerelle (192.168.1.1)         (attendu KO)
+  OK   TCP → hôte:192.168.1.10:8006            (attendu KO)
+```
+
+Les deux dernières lignes sont `OK` **si et seulement si** la sortie LAN est bien
+bloquée par la policy `DROP`.
+
+### 7. Test avec une nouvelle vidéo
+
+Ajoutez une vidéo dans une playlist surveillée. Dans les 5 minutes :
+
+```bash
+pct exec 120 -- journalctl -u guetteur -n 40 --no-pager
+# → "cycle terminé, envoyé=1"
+```
+
+Vérifiez côté vault :
+
+```bash
+pct exec 120 -- sudo -u guetteur -H git -C /opt/guetteur/data/vault log --oneline -3
+# → dernier commit "Veille : <titre de la vidéo>" pushé sur origin/main
+```
+
+Et côté Telegram : le résumé arrive avec les boutons `Bref / Standard / Détaillé /
+Question / Applicable ?`.
+
+### Vérifier que le durcissement systemd ne casse rien
+
+L'unité `deploy/guetteur.service` applique : `ProtectHome=yes` +
+`ReadWritePaths=/opt/guetteur/data /home/guetteur`, `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX`,
+`CapabilityBoundingSet=` (vide), `SystemCallFilter=@system-service`,
+`ProtectKernelModules`, `ProtectClock`, `LockPersonality`, `RestrictNamespaces`.
+
+Contrôle rapide (ces 4 commandes doivent réussir dans l'environnement du service) :
+
+```bash
+# On lance chaque outil avec exactement les mêmes contraintes que le service.
+run() { sudo systemd-run --uid=guetteur --gid=guetteur \
+    --property=ProtectHome=yes --property=ReadWritePaths=/opt/guetteur/data\ /home/guetteur \
+    --property=RestrictAddressFamilies=AF_INET\ AF_INET6\ AF_UNIX \
+    --property=CapabilityBoundingSet= --property=SystemCallFilter=@system-service \
+    --wait --pipe --collect --quiet -- "$@"; }
+run /usr/local/bin/claude --version      # → 1.x.x
+run /usr/bin/git --version               # → git version 2.x
+run /usr/bin/ffmpeg -version | head -1   # → ffmpeg version …
+run /home/guetteur/.local/bin/yt-dlp --version   # ou /usr/local/bin/yt-dlp
+```
+
+Si l'un de ces appels renvoie `Operation not permitted` ou `EPERM`, ajouter le
+syscall manquant à `SystemCallFilter` (`journalctl _AUDIT_TYPE_NAME=SECCOMP` donne
+le nom du syscall bloqué). Aucun cas connu à ce jour : `@system-service` couvre
+Python, git, ffmpeg, yt-dlp et le binaire `claude`.
 
 ---
 

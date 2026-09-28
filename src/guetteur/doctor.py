@@ -112,6 +112,41 @@ def check_secrets(config: Config) -> list[Check]:
     return checks
 
 
+def check_vault(config: Config) -> list[Check]:
+    """Ligne « vault : remote joignable » ajoutée quand [obsidian] est activé avec
+    un remote git : on tente un `git ls-remote` (timeout 10 s) via SSH, sans écrire.
+    En mode `git_sync = false` ou `git_remote = ""`, on ne renvoie qu'une ligne
+    récapitulative pour rester informatif."""
+    if not config.obsidian.enabled:
+        return []
+    if not config.obsidian.git_sync or not config.obsidian.git_remote:
+        return [
+            Check(
+                "vault : remote joignable",
+                True,
+                "sync git désactivé (git_sync = false ou git_remote vide)",
+            )
+        ]
+    remote = config.obsidian.git_remote
+    try:
+        proc = subprocess.run(
+            ["git", "ls-remote", "--exit-code", "--", remote, "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return [Check("vault : remote joignable", False, f"timeout > 10 s ({remote})")]
+    except OSError as exc:
+        return [Check("vault : remote joignable", False, f"git introuvable : {exc}")]
+    if proc.returncode == 0:
+        head = (proc.stdout.split() or [""])[0][:12]
+        return [Check("vault : remote joignable", True, f"{remote} (HEAD {head})")]
+    err = (proc.stderr or proc.stdout).strip().splitlines()[-1:] or [""]
+    return [Check("vault : remote joignable", False, f"{remote} : {err[0][:120]}")]
+
+
 def check_notebooklm(config: Config, store: Store | None = None) -> list[Check]:
     """4 lignes attendues par l'utilisateur en Lot 3 : version épinglée, permissions
     du home dédié, session (auth check), compte Google. Toutes gérées sans lever."""
@@ -236,6 +271,7 @@ def run_checks(
     checks.append(check_ffmpeg(which))
     checks.append(check_database(config))
     checks += check_secrets(config)
+    checks += check_vault(config)
     checks += check_notebooklm(config)
     return checks
 

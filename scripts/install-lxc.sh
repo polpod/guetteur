@@ -8,7 +8,8 @@
 #
 # Variables facultatives : REPO_URL (sinon git@github.com:polpod/guetteur.git, puis HTTPS),
 # INSTALL_DIR (/opt/guetteur), SERVICE_USER (guetteur), WITH_WHISPER=1, WITH_NOTEBOOKLM=1,
-# UPDATE_CLAUDE=1.
+# UPDATE_CLAUDE=1, WITH_VAULT=1 (clone du vault Obsidian dans data/vault),
+# VAULT_REMOTE (git@github.com:polpod/vault-veille.git par défaut).
 set -euo pipefail
 
 INSTALL_DIR="${INSTALL_DIR:-/opt/guetteur}"
@@ -18,6 +19,8 @@ REPO_HTTPS="https://github.com/polpod/guetteur.git"
 REPO_URL="${REPO_URL:-}"
 WITH_WHISPER="${WITH_WHISPER:-0}"
 WITH_NOTEBOOKLM="${WITH_NOTEBOOKLM:-1}" # extra epinglé, audité (voir audit §8-9)
+WITH_VAULT="${WITH_VAULT:-1}"           # clone du vault Obsidian (deploy key GitHub)
+VAULT_REMOTE="${VAULT_REMOTE:-git@github.com:polpod/vault-veille.git}"
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 UNITS=(
     guetteur.service
@@ -78,6 +81,104 @@ if ! id "$SERVICE_USER" >/dev/null 2>&1; then
         --shell /bin/bash "$SERVICE_USER"
 fi
 ok "$(id "$SERVICE_USER")"
+
+if [[ "$WITH_VAULT" == "1" ]]; then
+    log "Vault Obsidian ($VAULT_REMOTE)"
+    ssh_dir="/home/$SERVICE_USER/.ssh"
+    key_path="$ssh_dir/id_ed25519"
+    known_hosts="$ssh_dir/known_hosts"
+    vault_dir="$INSTALL_DIR/data/vault"
+
+    install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0700 "$ssh_dir"
+
+    # 1. Clé ed25519 dédiée pour la deploy key (idempotent : ne régénère pas si présente).
+    if [[ ! -f "$key_path" ]]; then
+        sudo -u "$SERVICE_USER" -H ssh-keygen -t ed25519 -N "" \
+            -C "guetteur@$(hostname)" -f "$key_path" -q
+    fi
+    chmod 0700 "$ssh_dir"
+    chmod 0600 "$key_path"
+    chmod 0644 "$key_path.pub"
+    chown -R "$SERVICE_USER:$SERVICE_USER" "$ssh_dir"
+
+    # 2. known_hosts : les 3 clés publiques de github.com, épinglées ici (source :
+    #    https://docs.github.com/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints).
+    #    Vérifiées par empreinte SHA256 avant écriture — jamais de StrictHostKeyChecking=no.
+    gh_kh="$(mktemp)"
+    cat >"$gh_kh" <<'KH'
+github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl
+github.com ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg=
+github.com ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCj7ndNxQowgcQnjshcLrqPEiiphnt+VTTvDP6mHBL9j1aNUkY4Ue1gvwnGLVlOhGeYrnZaMgRK6+PKCUXaDbC7qtbW8gIkhL7aGCsOr/C56SJMy/BCZfxd1nWzAOxSDPgVsmerOBYfNqltV9/hWCqBywINIR+5dIg6JTJ72pcEpEjcYgXkE2YEFXV1JHnsKgbLWNlhScqb2UmyRkQyytRLtL+38TGxkxCflmO+5Z8CSSNY7GidjMIZ7Q4zMjA2n1nGrlTDkzwDCsw+wqFPGQA179cnfGWOWRVruj16z6XyvxvjJwbz0wQZ75XK5tKSb7FNyeIEs4TT4jk+S4dhPeAUC5y+bDYirYgM4GC7uEnztnZyaVWQ7B381AK4Qdrwt51ZqExKbQpTUNn+EjqoTwvqNj4kqx5QUCI0ThS/YkOxJCXmPUWZbhjpCg56i+2aB6CmK2JGhn57K5mj0MNdBXA4/WnwH6XoPWJzK5Nyu2zB3nAZp+S5hpQs+p1vN1/wsjk=
+KH
+    expected_fps="SHA256:uNiVztksCsDhcc0u9e8BujQXVUpKZIDTMczCvj3tD2s
+SHA256:p2QAMXNIC1TJYWeIOttrVc98/R1BUFWu3/LiyKgUfQM
+SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU"
+    got_fps="$(ssh-keygen -lf "$gh_kh" | awk '{ print $2 }')"
+    while IFS= read -r fp; do
+        printf '%s\n' "$got_fps" | grep -qxF "$fp" \
+            || die "empreinte GitHub attendue absente : $fp (vérifier la source)"
+    done <<<"$expected_fps"
+
+    # Idempotent : on retire toute ancienne entrée github.com du known_hosts et on
+    # rajoute les 3 lignes vérifiées.
+    touch "$known_hosts"
+    grep -v '^github\.com ' "$known_hosts" > "$known_hosts.tmp" || true
+    cat "$gh_kh" >> "$known_hosts.tmp"
+    mv "$known_hosts.tmp" "$known_hosts"
+    chown "$SERVICE_USER:$SERVICE_USER" "$known_hosts"
+    chmod 0600 "$known_hosts"
+    rm -f "$gh_kh"
+    ok "known_hosts GitHub vérifiés (3 empreintes SHA256)"
+
+    # 3. Clone du vault. Si la clé n'est pas encore autorisée sur GitHub, on affiche
+    #    la clé publique et on attend. En mode non interactif (pas de TTY), on n'attend
+    #    pas : l'utilisateur relancera le script après ajout.
+    install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0755 "$INSTALL_DIR/data"
+    vault_git_ssh="ssh -o BatchMode=yes -i $key_path -o UserKnownHostsFile=$known_hosts \
+-o StrictHostKeyChecking=yes"
+    if [[ ! -d "$vault_dir/.git" ]]; then
+        # Tester d'abord l'accès (silencieux) : évite d'afficher la clé si la deploy
+        # key est déjà en place (relance d'install).
+        if ! sudo -u "$SERVICE_USER" -H env GIT_SSH_COMMAND="$vault_git_ssh" \
+            git ls-remote --exit-code "$VAULT_REMOTE" HEAD >/dev/null 2>&1; then
+            printf '\n\033[1;33m────────────────────────────────────────────────────────────\033[0m\n'
+            printf 'Clé publique du conteneur — à ajouter comme \033[1mdeploy key\033[0m\n'
+            printf 'AVEC \033[1maccès en écriture\033[0m sur %s :\n\n' "$VAULT_REMOTE"
+            cat "$key_path.pub"
+            printf '\nOuvrez : https://github.com/polpod/vault-veille/settings/keys/new\n'
+            printf '    - Title : guetteur (%s)\n' "$(hostname)"
+            printf '    - Key   : coller la clé ci-dessus\n'
+            printf '    - Cocher « Allow write access »\n'
+            printf '\033[1;33m────────────────────────────────────────────────────────────\033[0m\n\n'
+            if [[ -t 0 ]] || [[ -r /dev/tty ]]; then
+                printf 'Appuyez sur ENTRÉE une fois la clé ajoutée... '
+                if [[ -t 0 ]]; then
+                    read -r _
+                else
+                    read -r _ < /dev/tty
+                fi
+            else
+                log "Pas de terminal : arrêt. Ajoutez la deploy key puis relancez ce script."
+                exit 0
+            fi
+        fi
+        sudo -u "$SERVICE_USER" -H env GIT_SSH_COMMAND="$vault_git_ssh" \
+            git clone --quiet "$VAULT_REMOTE" "$vault_dir" \
+            || die "clone du vault échoué. Deploy key en écriture ajoutée sur $VAULT_REMOTE ?"
+    else
+        # Idempotent : pull ff-only, sans échouer si le remote n'est pas joignable.
+        sudo -u "$SERVICE_USER" -H env GIT_SSH_COMMAND="$vault_git_ssh" \
+            git -C "$vault_dir" pull --ff-only --quiet \
+            || log "vault : git pull impossible (remote injoignable), clone local conservé"
+    fi
+
+    # 4. user.name / user.email dans ce clone (jamais en global : le service peut
+    #    signer des commits GUETTEUR sans polluer la config globale de l'utilisateur).
+    sudo -u "$SERVICE_USER" -H git -C "$vault_dir" config user.name "GUETTEUR"
+    sudo -u "$SERVICE_USER" -H git -C "$vault_dir" config user.email "guetteur@localhost"
+    ok "vault $vault_dir prêt ($(sudo -u "$SERVICE_USER" -H \
+        git -C "$vault_dir" rev-parse --short HEAD 2>/dev/null || echo 'branche vide'))"
+fi
 
 log "Code dans $INSTALL_DIR"
 export GIT_TERMINAL_PROMPT=0 # jamais de demande interactive d'identifiants

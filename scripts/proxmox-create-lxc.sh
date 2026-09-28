@@ -89,7 +89,72 @@ log "Installation de GUETTEUR dans le conteneur"
 pct push "$CTID" "$INSTALL_SCRIPT" /root/install-lxc.sh --perms 0755
 pct exec "$CTID" -- env \
     REPO_URL="${REPO_URL:-}" WITH_WHISPER="${WITH_WHISPER:-0}" \
+    WITH_VAULT="${WITH_VAULT:-1}" WITH_NOTEBOOKLM="${WITH_NOTEBOOKLM:-1}" \
     bash /root/install-lxc.sh
+
+# --- Pare-feu Proxmox par conteneur -------------------------------------------------
+# On écrit /etc/pve/firewall/<CTID>.fw : sortie fermée par défaut, DNS d'abord, puis
+# DROP journalisé vers le LAN, puis ACCEPT vers l'Internet (443, 22, 80, ICMP).
+# NB : on ne touche PAS aux options datacenter/nœud — l'avertissement en fin de
+# script rappelle qu'il faut Datacenter et Nœud sur Firewall = Yes ET une règle IN
+# ACCEPT du LAN vers l'hôte:8006/22 AVANT d'activer ce firewall.
+FW_DIR="/etc/pve/firewall"
+FW_FILE="$FW_DIR/${CTID}.fw"
+if [[ ! -d "$FW_DIR" ]]; then
+    mkdir -p "$FW_DIR"
+fi
+log "Pare-feu Proxmox : $FW_FILE"
+cat >"$FW_FILE" <<'FW'
+[OPTIONS]
+enable: 1
+policy_in: DROP
+policy_out: DROP
+log_level_in: info
+log_level_out: info
+
+[RULES]
+# DNS d'abord (les résolutions DOIVENT passer avant les DROP LAN qui suivent).
+OUT ACCEPT -p udp -dport 53 -log nolog # DNS UDP
+OUT ACCEPT -p tcp -dport 53 -log nolog # DNS TCP (résolution de gros paquets)
+
+# DROP explicite et journalisé vers le LAN (RFC 1918) : le conteneur ne doit pas
+# scanner ni atteindre l'hôte Proxmox, les NAS, les autres LXC, etc.
+OUT DROP -dest 192.168.0.0/16 -log info # LAN /16
+OUT DROP -dest 10.0.0.0/8 -log info     # LAN /8
+OUT DROP -dest 172.16.0.0/12 -log info  # LAN /12 (docker default incl.)
+
+# Sortie Internet autorisée.
+OUT ACCEPT -p tcp -dport 443 -log nolog # HTTPS (api.telegram.org, api.anthropic.com, github.com, notebooklm.google.com)
+OUT ACCEPT -p tcp -dport 22 -log nolog  # git@github.com (vault sync)
+OUT ACCEPT -p tcp -dport 80 -log nolog  # apt (deb.debian.org), redirections HTTP
+OUT ACCEPT -p icmp -log nolog           # ping/MTU discovery
+FW
+chmod 640 "$FW_FILE" 2>/dev/null || true # /etc/pve est un pmxcfs FUSE, ignorer les perms si refusées
 
 ip="$(pct exec "$CTID" -- hostname -I | awk '{ print $1 }')"
 log "Conteneur $CTID prêt : ${ip:-IP inconnue}. Connectez-vous : ssh root@${ip:-<ip>} (ou pct enter $CTID)"
+
+printf '\n\033[1;33m'
+cat <<'WARN'
+╔══════════════════════════════════════════════════════════════════════════╗
+║  Pare-feu du conteneur écrit dans /etc/pve/firewall/CTID.fw.             ║
+║                                                                          ║
+║  Il ne s'applique PAS tant que ces trois conditions ne sont pas          ║
+║  toutes remplies dans Proxmox :                                          ║
+║                                                                          ║
+║    1. Datacenter → Firewall → « Firewall » sur Yes.                      ║
+║    2. Nœud       → Firewall → « Firewall » sur Yes.                      ║
+║    3. Conteneur  → Firewall → « Firewall » sur Yes.                      ║
+║                                                                          ║
+║  AVANT d'activer le firewall du datacenter, ajoutez une règle IN         ║
+║  ACCEPT depuis votre LAN vers l'hôte, sinon vous perdez l'accès à        ║
+║  Proxmox et à SSH :                                                      ║
+║                                                                          ║
+║    Datacenter → Firewall → Add :                                         ║
+║      Direction=in  Action=ACCEPT  Source=<votre-LAN>/24  Dport=8006      ║
+║      Direction=in  Action=ACCEPT  Source=<votre-LAN>/24  Dport=22        ║
+║                                                                          ║
+║  Ensuite : bash scripts/firewall-check.sh CTID   (depuis l'hôte)         ║
+╚══════════════════════════════════════════════════════════════════════════╝
+WARN
+printf '\033[0m\n'

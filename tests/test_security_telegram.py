@@ -245,7 +245,7 @@ def test_ideas_read_error_hides_absolute_path(
     projets.mkdir(parents=True)
     (projets / "IDEES.md").write_text("# Idées\n", encoding="utf-8")
 
-    def fake_read_text(self: Path, encoding: str = "utf-8") -> str:  # noqa: ARG001
+    def fake_read_text(self: Path, encoding: str = "utf-8") -> str:
         raise PermissionError(
             "[Errno 13] Permission denied: '/opt/guetteur/vault/Projets/coder/IDEES.md'"
         )

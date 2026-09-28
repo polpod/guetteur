@@ -23,12 +23,33 @@ Restart=always
 RestartSec=10
 TimeoutStopSec=30
 
-# Durcissement léger : ~/.claude (session) et /opt/guetteur/data restent inscriptibles.
+# Durcissement (lot déploiement). ProtectHome=yes masque les /home/* ; le service
+# a besoin de son propre HOME (/home/guetteur pour la session Claude Code stockée
+# dans ~/.claude/) → on liste /home/guetteur en ReadWritePaths. /opt/guetteur/data
+# (base SQLite, vault Obsidian, NotebookLM home) doit rester inscriptible.
 NoNewPrivileges=true
 PrivateTmp=true
-ProtectSystem=full
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/guetteur/data /home/guetteur
 ProtectKernelTunables=true
+ProtectKernelModules=true
 ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+# git (SSH pour le vault), claude, yt-dlp et ffmpeg n'ont besoin que d'IP + local sockets.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# Aucune capability nécessaire (le service ne fait ni bind privilégié, ni ptrace).
+CapabilityBoundingSet=
+AmbientCapabilities=
+# Whitelist des appels système utiles à un service Python + subprocess.
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
 
 [Install]
 WantedBy=multi-user.target
