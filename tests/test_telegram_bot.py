@@ -164,7 +164,7 @@ def store_and_video(tmp_path: Path) -> Iterator[tuple[Store, str]]:
     from guetteur.models import Video as _Video
 
     store = Store(tmp_path / "guetteur.db")
-    video_id = "VID_BOT_1"
+    video_id = "VIDBOT12345"  # 11 chars = format YouTube
     store.add_new(_Video(video_id, "Titre", "Chaîne", None, f"https://youtu.be/{video_id}"), "PL")
     store.set_transcript(
         video_id,
@@ -206,10 +206,10 @@ def _make_bot(config: Config, store: Store, api: FakeApi, summarizer: Any) -> Te
 @pytest.mark.parametrize(
     ("data", "expected"),
     [
-        ("v:ABC123:d:bref", ("ABC123", "detail", "bref")),
-        ("v:ABC-XYZ_9:d:standard", ("ABC-XYZ_9", "detail", "standard")),
-        ("v:ABC:d:detaille", ("ABC", "detail", "detaille")),
-        ("v:ABC:q", ("ABC", "question", None)),
+        ("v:ABC123XYZ_-:d:bref", ("ABC123XYZ_-", "detail", "bref")),
+        ("v:aB-XYZ_9abc:d:standard", ("aB-XYZ_9abc", "detail", "standard")),
+        ("v:11charYouTa:d:detaille", ("11charYouTa", "detail", "detaille")),
+        ("v:VIDBOT12345:q", ("VIDBOT12345", "question", None)),
     ],
 )
 def test_parse_callback_data_valid(data: str, expected: tuple[str, str, str | None]) -> None:

@@ -46,6 +46,21 @@ _BACKOFF_S = (5.0, 30.0, 60.0)  # backoff progressif après une exception
 # `slugify_title` côté export Obsidian.
 _VALID_PROJECT_SLUG = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
 
+# Format d'un video_id YouTube : 11 caractères base64url-safe. Utilisé partout où
+# un video_id entre par une commande utilisateur (Lot 7 §1). Toute autre valeur
+# est refusée avec un message clair : évite du bruit dans les logs, dans les
+# callbacks Telegram, et bloque un futur bug où `video_id` finirait sur un chemin.
+_VALID_VIDEO_ID = re.compile(r"[A-Za-z0-9_-]{11}")
+
+# Longueur maximale d'une question Q&A envoyée à Claude (Lot 7 §7). Au-delà, on
+# refuse l'envoi : le prompt système exige 1500 caractères de RÉPONSE, aucune
+# raison d'accepter une question qui gonfle le contexte au-delà du raisonnable.
+QUESTION_MAX_CHARS = 2000
+
+# Longueur maximale d'une commande texte reçue (protège contre les 4096 chars
+# possibles côté Telegram — la plupart des commandes tiennent en 50 chars).
+COMMAND_MAX_CHARS = 512
+
 
 # --- API bas niveau Telegram ----------------------------------------------------------
 
@@ -135,8 +150,10 @@ class CallbackAction:
     project_slug: str | None = None
 
 
+# Callback_data borné exactement au format YouTube (Lot 7 §6) : 11 chars pour le
+# video_id, slug ≤ 32. La longueur totale reste ≤ 64 bytes (limite Telegram).
 _CALLBACK_RE = re.compile(
-    r"^v:([A-Za-z0-9_\-]+):"
+    r"^v:([A-Za-z0-9_\-]{11}):"
     r"(?:"
     r"d:(bref|standard|detaille)"  # niveau détail
     r"|q"  # question
@@ -528,6 +545,11 @@ class TelegramBot:
     def _deliver_summary_from_button(
         self, video_id: str, detail: DetailLevel, callback_id: str
     ) -> None:
+        # Lot 7 §1 : sanity check — la regex du callback l'a déjà validé, mais
+        # cette méthode est aussi appelée par /detail après _run_admin.
+        if not _VALID_VIDEO_ID.fullmatch(video_id):
+            self._answer_cb(callback_id, "Identifiant vidéo invalide")
+            return
         record = self._store.get(video_id)
         if record is None:
             self._answer_cb(callback_id, "Vidéo introuvable en base")
@@ -626,9 +648,20 @@ class TelegramBot:
         self._store.set_meta(META_AWAITING_UNTIL, "")
 
     def _answer_question(self, video_id: str, question: str) -> None:
+        # Lot 7 §1 : video_id validé avant tout accès au store / à Claude.
+        if not _VALID_VIDEO_ID.fullmatch(video_id):
+            self._send_plain("Identifiant vidéo invalide.")
+            return
+        # Lot 7 §7 : longueur bornée AVANT tout appel Claude (coût + DoS).
+        if len(question) > QUESTION_MAX_CHARS:
+            self._send_plain(
+                f"Question trop longue ({len(question)} caractères, max "
+                f"{QUESTION_MAX_CHARS}). Reformulez plus court."
+            )
+            return
         record = self._store.get(video_id)
         if record is None:
-            self._send_plain(f"Vidéo {video_id} introuvable.")
+            self._send_plain("Vidéo introuvable.")
             return
         try:
             transcript = self._require_transcript(record)
@@ -672,6 +705,10 @@ class TelegramBot:
     # --- commandes texte ---------------------------------------------------------------
 
     def _handle_command(self, text: str, _message: dict[str, Any]) -> None:
+        # Lot 7 §7 : borne de sécurité — une commande légitime tient en < 100 chars.
+        if len(text) > COMMAND_MAX_CHARS:
+            self._send_plain("Commande trop longue.")
+            return
         parts = text.split()
         cmd = parts[0].lower().split("@", 1)[0]
         args = parts[1:]
@@ -743,7 +780,13 @@ class TelegramBot:
         try:
             text = ideas_path.read_text(encoding="utf-8")
         except OSError as exc:
-            self._send_plain(f"Lecture impossible : {exc}")
+            # Lot 7 §6 : ne pas fuiter le chemin absolu du vault ; on logue le détail
+            # côté serveur et on renvoie un message générique à l'utilisateur.
+            log.warning(
+                "telegram_bot.ideas_read_failed",
+                extra={"slug": slug, "error": f"{type(exc).__name__}: {exc}"},
+            )
+            self._send_plain(f"Lecture de IDEES.md impossible ({type(exc).__name__}).")
             return
         # Découpe sur les frontières « \n## » (chaque entrée commence par « ## <date> »).
         blocks = [b.strip() for b in text.split("\n## ") if b.strip()]
@@ -810,9 +853,21 @@ class TelegramBot:
             self._send_plain("applicability.enabled = false dans config.toml")
             return
         video_id = args[0]
+        # Lot 7 §1 : format YouTube strict avant tout accès store/Claude.
+        if not _VALID_VIDEO_ID.fullmatch(video_id):
+            self._send_plain("Identifiant vidéo invalide (format YouTube attendu).")
+            return
         record = self._store.get(video_id)
         if record is None or record.summary is None:
-            self._send_plain(f"Vidéo {video_id} sans résumé en base.")
+            self._send_plain("Vidéo sans résumé en base.")
+            return
+        # Lot 7 §2 : la passe applicabilité est un appel Claude → doit compter dans
+        # le rate limit au même titre que /detail et les questions.
+        if not self._rate_limit.allow(self._chat_id):
+            self._send_plain(
+                f"Limite de {self._config.telegram.rate_limit_per_hour} générations "
+                "par heure atteinte. Réessayez plus tard."
+            )
             return
         from guetteur.export.obsidian import ObsidianExporter
         from guetteur.summarize.applicability import build_evaluator_from_summarizer
@@ -831,6 +886,7 @@ class TelegramBot:
             with self._claude_lock:
                 pertinences = evaluator.evaluate(video, summary, sheets)
         except Exception as exc:
+            log.exception("telegram_bot.applicability_failed", extra={"video_id": video_id})
             self._send_plain(f"Applicabilité en échec : {type(exc).__name__}")
             return
         self._store.clear_applicability(video_id)
@@ -895,6 +951,10 @@ class TelegramBot:
 
     def _run_admin(self, cmd: str, args: list[str]) -> None:
         video_id = args[0]
+        # Lot 7 §1 : format YouTube strict avant tout accès (protège logs + callbacks).
+        if not _VALID_VIDEO_ID.fullmatch(video_id):
+            self._send_plain("Identifiant vidéo invalide (format YouTube attendu).")
+            return
         record = self._store.get(video_id)
         if record is None:
             self._send_plain(f"Vidéo inconnue : {video_id}")

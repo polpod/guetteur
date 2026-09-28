@@ -130,10 +130,10 @@ def test_bot_flow_summary_button_qa_and_cache(tmp_path: Path) -> None:
     call_counter = {"n": 0}
 
     def counted_create(**kwargs: Any) -> SimpleNamespace:
-        # Si le prompt utilisateur mentionne une « Question de l'utilisateur », c'est
-        # une Q&A ; sinon c'est une génération de résumé.
+        # Si le prompt utilisateur contient la balise <question>, c'est une Q&A ;
+        # sinon c'est une génération de résumé (Lot 7 §3 : encadrement des données).
         content = str(kwargs.get("messages", [{}])[0].get("content", ""))
-        if "Question de l'utilisateur" in content:
+        if "<question>" in content:
             return qa_create(**kwargs)
         call_counter["n"] += 1
         result: SimpleNamespace = original_create(**kwargs)
