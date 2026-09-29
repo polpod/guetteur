@@ -16,6 +16,8 @@ Group=guetteur
 WorkingDirectory=/opt/guetteur
 Environment=NOTEBOOKLM_HOME=/opt/guetteur/data/nlm
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=LANG=fr_FR.UTF-8
+Environment=LC_ALL=fr_FR.UTF-8
 # --quiet limite la sortie ; le service échoue silencieusement si les cookies sont
 # perdus (l'admin doit alors refaire un login WSL et pousser le master token).
 ExecStart=/usr/local/bin/notebooklm auth refresh --quiet

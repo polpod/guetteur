@@ -4,12 +4,16 @@
 #   bash install-lxc.sh
 #
 # Lancé automatiquement par proxmox-create-lxc.sh. Idempotent : chaque outil n'est installé
-# que s'il manque, le dépôt est mis à jour s'il est déjà cloné.
+# que s'il manque, le dépôt est mis à jour s'il est déjà cloné, l'utilisateur, les locales
+# et le vault sont posés une seule fois.
 #
 # Variables facultatives : REPO_URL (sinon git@github.com:polpod/guetteur.git, puis HTTPS),
 # INSTALL_DIR (/opt/guetteur), SERVICE_USER (guetteur), WITH_WHISPER=1, WITH_NOTEBOOKLM=1,
 # UPDATE_CLAUDE=1, WITH_VAULT=1 (clone du vault Obsidian dans data/vault),
 # VAULT_REMOTE (git@github.com:polpod/vault-veille.git par défaut).
+#
+# Testing : `INSTALL_LXC_TESTING=1 . install-lxc.sh` charge les fonctions sans exécuter le
+# corps principal (voir tests/test_install_lxc.py).
 set -euo pipefail
 
 INSTALL_DIR="${INSTALL_DIR:-/opt/guetteur}"
@@ -33,9 +37,53 @@ UNITS=(
 NLM_VERSION="0.8.3"
 NLM_HASH="sha256:7e3e02057b3acf354d3dbc337c08869d2a4954c9c324f3271e272236cfcc2bfc"
 
+# uv est installé par le script officiel dans /usr/local/bin ; on n'utilise QUE le chemin
+# absolu, jamais `uv` via PATH (sudo -u réinitialise PATH, le service systemd aussi).
+UV_BIN="/usr/local/bin/uv"
+
+# Empreintes SHA256 publiées par GitHub (source :
+# https://docs.github.com/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints).
+# À réviser si GitHub tourne ses clés — c'est la seule source d'autorité, jamais un
+# `StrictHostKeyChecking=no` ni un `ssh-keyscan` sans vérification.
+GITHUB_FINGERPRINTS="SHA256:uNiVztksCsDhcc0u9e8BujQXVUpKZIDTMczCvj3tD2s
+SHA256:p2QAMXNIC1TJYWeIOttrVc98/R1BUFWu3/LiyKgUfQM
+SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU"
+
 log() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 ok() { printf '    \033[32m✓\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31mErreur :\033[0m %s\n' "$*" >&2; exit 1; }
+
+# Lit sur stdin la sortie de `ssh-keyscan -t ed25519,ecdsa,rsa github.com`, calcule
+# l'empreinte SHA256 de chaque clé et n'écrit sur stdout que celles publiées par
+# GitHub (GITHUB_FINGERPRINTS). Retourne 0 si au moins une clé a été validée, 1
+# sinon — testé par tests/test_install_lxc.py.
+verify_github_keys() {
+    local validated=0 line fp tmp
+    tmp="$(mktemp)"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -z "$line" || "$line" =~ ^# ]] && continue
+        printf '%s\n' "$line" >"$tmp"
+        if ! fp="$(ssh-keygen -lf "$tmp" 2>/dev/null | awk '{ print $2 }')"; then
+            continue
+        fi
+        [[ -z "$fp" ]] && continue
+        if printf '%s\n' "$GITHUB_FINGERPRINTS" | grep -qxF "$fp"; then
+            printf '%s\n' "$line"
+            validated=$((validated + 1))
+        fi
+    done
+    rm -f "$tmp"
+    if ((validated > 0)); then
+        return 0
+    fi
+    return 1
+}
+
+# Sourcé depuis les tests : on s'arrête ici, seule la définition des fonctions
+# est chargée dans le shell appelant.
+if [[ "${INSTALL_LXC_TESTING:-0}" == "1" ]]; then
+    return 0 2>/dev/null || exit 0
+fi
 
 [[ $EUID -eq 0 ]] || die "à lancer en root"
 # shellcheck disable=SC1091
@@ -45,21 +93,50 @@ export DEBIAN_FRONTEND=noninteractive
 
 log "Paquets système"
 missing=()
-for pkg in ca-certificates curl git ffmpeg sudo gnupg; do
+for pkg in ca-certificates curl git ffmpeg sudo gnupg locales openssh-client; do
     dpkg -s "$pkg" >/dev/null 2>&1 || missing+=("$pkg")
 done
 if ((${#missing[@]})); then
     apt-get update -q
     apt-get install -y -q --no-install-recommends "${missing[@]}"
 fi
-ok "git $(git --version | awk '{ print $3 }'), curl, ffmpeg"
+ok "git $(git --version | awk '{ print $3 }'), curl, ffmpeg, locales"
+
+log "Locales fr_FR.UTF-8 et en_US.UTF-8"
+# `locale -a` sort du fr_FR.utf8 ou fr_FR.UTF-8 selon les versions — on compare sans
+# tiret ni casse via tr.
+have_locale() {
+    local target
+    target="$(printf '%s' "$1" | tr -d '-' | tr '[:upper:]' '[:lower:]')"
+    locale -a 2>/dev/null \
+        | tr -d '-' \
+        | tr '[:upper:]' '[:lower:]' \
+        | grep -qxF "$target"
+}
+if ! have_locale "fr_FR.UTF-8" || ! have_locale "en_US.UTF-8"; then
+    # Décommente les deux lignes dans /etc/locale.gen (idempotent : si déjà décommenté,
+    # le sed est un no-op) puis regénère.
+    sed -i -E \
+        -e 's/^# *(fr_FR\.UTF-8 UTF-8)/\1/' \
+        -e 's/^# *(en_US\.UTF-8 UTF-8)/\1/' \
+        /etc/locale.gen
+    locale-gen fr_FR.UTF-8 en_US.UTF-8 >/dev/null
+    update-locale LANG=fr_FR.UTF-8 LANGUAGE=fr_FR:fr
+fi
+export LANG=fr_FR.UTF-8 LC_ALL=fr_FR.UTF-8
+ok "locales fr_FR.UTF-8, en_US.UTF-8"
 
 log "uv (script officiel)"
-if ! command -v uv >/dev/null 2>&1; then
+if [[ ! -x "$UV_BIN" ]]; then
     curl -LsSf https://astral.sh/uv/install.sh \
         | env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh
 fi
-ok "$(uv --version)"
+# L'installeur peut silencieusement tomber en /root/.local/bin si UV_INSTALL_DIR est
+# ignoré : on vérifie explicitement plutôt que d'afficher un ✓ vide (l'appel initial
+# `command -v uv` réussirait à cause du hash bash, mais `sudo -u guetteur uv ...`
+# planterait plus loin — cf. incident /usr/local/bin PATH).
+[[ -x "$UV_BIN" ]] || die "uv absent après installation ($UV_BIN). PATH du service ?"
+ok "$("$UV_BIN" --version)"
 
 log "Node.js 22 (NodeSource)"
 if ! node --version 2>/dev/null | grep -q '^v22\.'; then
@@ -101,34 +178,31 @@ if [[ "$WITH_VAULT" == "1" ]]; then
     chmod 0644 "$key_path.pub"
     chown -R "$SERVICE_USER:$SERVICE_USER" "$ssh_dir"
 
-    # 2. known_hosts : les 3 clés publiques de github.com, épinglées ici (source :
-    #    https://docs.github.com/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints).
-    #    Vérifiées par empreinte SHA256 avant écriture — jamais de StrictHostKeyChecking=no.
+    # 2. known_hosts : récupère les clés courantes via ssh-keyscan puis n'écrit QUE
+    #    celles dont l'empreinte SHA256 fait partie de la liste publiée par GitHub
+    #    (au moins une match requise). Idempotent — on retire toute ancienne entrée
+    #    github.com et on écrit les clés validées.
     gh_kh="$(mktemp)"
-    cat >"$gh_kh" <<'KH'
-github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl
-github.com ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg=
-github.com ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCj7ndNxQowgcQnjshcLrqPEiiphnt+VTTvDP6mHBL9j1aNUkY4Ue1gvwnGLVlOhGeYrnZaMgRK6+PKCUXaDbC7qtbW8gIkhL7aGCsOr/C56SJMy/BCZfxd1nWzAOxSDPgVsmerOBYfNqltV9/hWCqBywINIR+5dIg6JTJ72pcEpEjcYgXkE2YEFXV1JHnsKgbLWNlhScqb2UmyRkQyytRLtL+38TGxkxCflmO+5Z8CSSNY7GidjMIZ7Q4zMjA2n1nGrlTDkzwDCsw+wqFPGQA179cnfGWOWRVruj16z6XyvxvjJwbz0wQZ75XK5tKSb7FNyeIEs4TT4jk+S4dhPeAUC5y+bDYirYgM4GC7uEnztnZyaVWQ7B381AK4Qdrwt51ZqExKbQpTUNn+EjqoTwvqNj4kqx5QUCI0ThS/YkOxJCXmPUWZbhjpCg56i+2aB6CmK2JGhn57K5mj0MNdBXA4/WnwH6XoPWJzK5Nyu2zB3nAZp+S5hpQs+p1vN1/wsjk=
-KH
-    expected_fps="SHA256:uNiVztksCsDhcc0u9e8BujQXVUpKZIDTMczCvj3tD2s
-SHA256:p2QAMXNIC1TJYWeIOttrVc98/R1BUFWu3/LiyKgUfQM
-SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU"
-    got_fps="$(ssh-keygen -lf "$gh_kh" | awk '{ print $2 }')"
-    while IFS= read -r fp; do
-        printf '%s\n' "$got_fps" | grep -qxF "$fp" \
-            || die "empreinte GitHub attendue absente : $fp (vérifier la source)"
-    done <<<"$expected_fps"
-
-    # Idempotent : on retire toute ancienne entrée github.com du known_hosts et on
-    # rajoute les 3 lignes vérifiées.
+    gh_valid="$(mktemp)"
+    # shellcheck disable=SC2064
+    trap "rm -f '$gh_kh' '$gh_valid'" RETURN
+    if ! ssh-keyscan -t ed25519,ecdsa,rsa -T 10 github.com >"$gh_kh" 2>/dev/null; then
+        die "ssh-keyscan github.com échoué (réseau ? proxy ?)"
+    fi
+    if ! verify_github_keys <"$gh_kh" >"$gh_valid"; then
+        die "aucune clé ssh-keyscan github.com ne correspond aux empreintes publiées \
+(https://docs.github.com/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints)."
+    fi
+    n_valid="$(grep -c . "$gh_valid" || true)"
     touch "$known_hosts"
-    grep -v '^github\.com ' "$known_hosts" > "$known_hosts.tmp" || true
-    cat "$gh_kh" >> "$known_hosts.tmp"
+    grep -v '^github\.com ' "$known_hosts" >"$known_hosts.tmp" || true
+    cat "$gh_valid" >>"$known_hosts.tmp"
     mv "$known_hosts.tmp" "$known_hosts"
     chown "$SERVICE_USER:$SERVICE_USER" "$known_hosts"
     chmod 0600 "$known_hosts"
-    rm -f "$gh_kh"
-    ok "known_hosts GitHub vérifiés (3 empreintes SHA256)"
+    rm -f "$gh_kh" "$gh_valid"
+    trap - RETURN
+    ok "known_hosts GitHub vérifiés ($n_valid empreinte(s) SHA256 sur 3 attendues)"
 
     # 3. Clone du vault. Si la clé n'est pas encore autorisée sur GitHub, on affiche
     #    la clé publique et on attend. En mode non interactif (pas de TTY), on n'attend
@@ -155,7 +229,7 @@ SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU"
                 if [[ -t 0 ]]; then
                     read -r _
                 else
-                    read -r _ < /dev/tty
+                    read -r _ </dev/tty
                 fi
             else
                 log "Pas de terminal : arrêt. Ajoutez la deploy key puis relancez ce script."
@@ -203,7 +277,8 @@ else
     # Clonage dans un dossier temporaire : un échec ne touche jamais $INSTALL_DIR (qui peut
     # déjà contenir .env et data/ d'une installation par copie).
     tmp_clone="$(mktemp -d)"
-    trap 'rm -rf "$tmp_clone"' EXIT
+    # shellcheck disable=SC2064
+    trap "rm -rf '$tmp_clone'" EXIT
     cloned=""
     for url in ${REPO_URL:+"$REPO_URL"} "$REPO_SSH" "$REPO_HTTPS"; do
         if git clone --quiet "$url" "$tmp_clone/repo" 2>/dev/null; then
@@ -234,8 +309,13 @@ log "Python 3.12 et dépendances (uv sync --no-dev)"
 extra=()
 [[ "$WITH_WHISPER" == "1" ]] && extra+=(--extra whisper)
 [[ "$WITH_NOTEBOOKLM" == "1" ]] && extra+=(--extra notebooklm)
-sudo -u "$SERVICE_USER" -H bash -c 'cd "$1" && shift && uv python install 3.12 \
-    && uv sync --frozen --no-dev --python 3.12 "$@"' _ "$INSTALL_DIR" "${extra[@]}"
+# On passe le chemin absolu de uv dans le sub-shell : sudo -u réinitialise PATH,
+# et l'utilisateur guetteur n'a pas /usr/local/bin dans son login PATH par défaut.
+sudo -u "$SERVICE_USER" -H bash -c '
+    cd "$1" && shift
+    "'"$UV_BIN"'" python install 3.12
+    "'"$UV_BIN"'" sync --frozen --no-dev --python 3.12 "$@"
+' _ "$INSTALL_DIR" "${extra[@]}"
 ok "environnement prêt ($INSTALL_DIR/.venv)"
 
 if [[ "$WITH_NOTEBOOKLM" == "1" ]]; then
@@ -243,18 +323,19 @@ if [[ "$WITH_NOTEBOOKLM" == "1" ]]; then
     # Contraintes uv : version + hash sha256 audité. Wheel seulement (--no-sources
     # empêche toute source-dist qui exécuterait le hook de build).
     nlm_constraints="$(mktemp)"
-    trap 'rm -f "$nlm_constraints"' EXIT
+    # shellcheck disable=SC2064
+    trap "rm -f '$nlm_constraints'" EXIT
     cat >"$nlm_constraints" <<EOF
 notebooklm-py==${NLM_VERSION} --hash=${NLM_HASH}
 EOF
     # `uv tool install` crée /root/.local/share/uv/tools/notebooklm-py/ et un
     # entrypoint dans /root/.local/bin ; on symlink dans /usr/local/bin pour le
     # service systemd (User=guetteur n'a pas /root/.local/bin dans le PATH).
-    if ! /usr/local/bin/uv tool install --force --constraints "$nlm_constraints" \
+    if ! "$UV_BIN" tool install --force --constraints "$nlm_constraints" \
         "notebooklm-py==${NLM_VERSION}" >/dev/null; then
         die "installation de notebooklm-py $NLM_VERSION en échec (hash sha256 ?)."
     fi
-    nlm_bin="$(/usr/local/bin/uv tool dir)/notebooklm-py/bin/notebooklm"
+    nlm_bin="$("$UV_BIN" tool dir)/notebooklm-py/bin/notebooklm"
     [[ -x "$nlm_bin" ]] || die "notebooklm introuvable après uv tool install ($nlm_bin)"
     ln -sf "$nlm_bin" /usr/local/bin/notebooklm
     ok "$(/usr/local/bin/notebooklm --version 2>&1 | head -1)"
@@ -269,9 +350,9 @@ cat >/usr/local/bin/guetteur <<WRAPPER
 # Lance la CLI GUETTEUR depuis $INSTALL_DIR, sous l'utilisateur $SERVICE_USER.
 cd "$INSTALL_DIR" || exit 1
 if [ "\$(id -un)" = "$SERVICE_USER" ]; then
-    exec /usr/local/bin/uv run --no-sync guetteur "\$@"
+    exec $UV_BIN run --no-sync guetteur "\$@"
 fi
-exec sudo -u "$SERVICE_USER" -H /usr/local/bin/uv run --no-sync guetteur "\$@"
+exec sudo -u "$SERVICE_USER" -H $UV_BIN run --no-sync guetteur "\$@"
 WRAPPER
 chmod 755 /usr/local/bin/guetteur
 ok "guetteur status | doctor | health | retry | reset…"
