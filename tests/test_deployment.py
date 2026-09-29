@@ -348,7 +348,64 @@ def test_install_lxc_installs_notebooklm_as_service_user() -> None:
     assert 'nlm_bin="/home/$SERVICE_USER/.local/bin/notebooklm"' in src
 
 
-# --- 5. shellcheck --------------------------------------------------------------------
+# --- 5. deploy.sh / install-lxc.sh : conserver --extra notebooklm --------------------
+
+
+DEPLOY_SCRIPT = SCRIPTS_DIR / "deploy.sh"
+INSTALL_SCRIPT = SCRIPTS_DIR / "install-lxc.sh"
+
+
+@pytest.mark.parametrize(
+    "script",
+    [DEPLOY_SCRIPT, INSTALL_SCRIPT],
+    ids=lambda p: p.name,
+)
+def test_uv_sync_always_carries_extra_notebooklm(script: Path) -> None:
+    """Régression : sans --extra notebooklm, uv sync désinstalle notebooklm-py
+    du venv à chaque redéploiement et l'archivage casse au cycle suivant. Les
+    deux scripts DOIVENT pousser cet extra sans condition (le wheel est petit)."""
+    src = script.read_text(encoding="utf-8")
+    # L'extra apparaît dans un array bash initialisé avant l'appel uv sync.
+    assert re.search(r"(?:extra|extras)=\(--extra notebooklm\)", src), (
+        f"{script.name} : --extra notebooklm doit être ajouté systématiquement"
+    )
+
+
+def test_deploy_sh_runs_doctor_and_fails_on_ko() -> None:
+    """En fin de deploy.sh, `guetteur doctor` doit tourner et faire échouer le
+    script si une ligne est KO — l'admin le voit tout de suite plutôt qu'au
+    prochain cycle qui pourrait passer une vidéo en failed."""
+    src = DEPLOY_SCRIPT.read_text(encoding="utf-8")
+    # Utilise le wrapper /usr/local/bin/guetteur (qui sudo -u au bon utilisateur).
+    assert re.search(r"if\s*!\s*/usr/local/bin/guetteur doctor;\s*then", src), (
+        "guetteur doctor absent ou pas guardé par `if ! ... ; then die ...`"
+    )
+    assert re.search(r"die\b.*doctor", src), "die() manquant sur l'échec de doctor"
+
+
+def test_deploy_sh_reads_whisper_from_config() -> None:
+    """--extra whisper est plus lourd (faster-whisper + torch) : il ne doit
+    être ajouté que quand config.toml a [transcript] whisper_enabled = true."""
+    src = DEPLOY_SCRIPT.read_text(encoding="utf-8")
+    assert "whisper_wanted" in src
+    assert re.search(r'whisper_wanted "\$INSTALL_DIR/config\.toml"', src)
+    assert re.search(r"extras\+=\(--extra whisper\)", src)
+
+
+def test_whisper_wanted_helper_shape() -> None:
+    """La fonction whisper_wanted doit être identique dans les deux scripts
+    (source d'autorité : install-lxc.sh) — évite qu'elle diverge silencieusement."""
+    for script in (DEPLOY_SCRIPT, INSTALL_SCRIPT):
+        src = script.read_text(encoding="utf-8")
+        # Signature awk : section [transcript] et whisper_enabled = true.
+        assert re.search(r"whisper_wanted\(\)\s*\{", src), f"{script.name} : whisper_wanted absent"
+        assert 'section ~ /^\\[transcript\\]/' in src, (
+            f"{script.name} : awk cherche la mauvaise section"
+        )
+        assert "whisper_enabled" in src
+
+
+# --- 6. shellcheck --------------------------------------------------------------------
 
 
 def _shell_scripts() -> list[Path]:

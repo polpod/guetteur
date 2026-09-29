@@ -53,6 +53,21 @@ log() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 ok() { printf '    \033[32m✓\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31mErreur :\033[0m %s\n' "$*" >&2; exit 1; }
 
+# Renvoie 0 si config.toml (au chemin passé en arg) déclare [transcript]
+# whisper_enabled = true. Utilisée par install-lxc.sh et deploy.sh pour décider
+# d'ajouter --extra whisper à uv sync.
+whisper_wanted() {
+    local cfg="$1"
+    [[ -f "$cfg" ]] || return 1
+    awk '
+        /^[[:space:]]*\[/ { section = $0 }
+        section ~ /^\[transcript\]/ \
+            && /^[[:space:]]*whisper_enabled[[:space:]]*=[[:space:]]*true([[:space:]]|$|#)/ \
+            { found = 1 }
+        END { exit !found }
+    ' "$cfg"
+}
+
 # Lit sur stdin la sortie de `ssh-keyscan -t ed25519,ecdsa,rsa github.com`, calcule
 # l'empreinte SHA256 de chaque clé et n'écrit sur stdout que celles publiées par
 # GitHub (GITHUB_FINGERPRINTS). Retourne 0 si au moins une clé a été validée, 1
@@ -326,9 +341,15 @@ chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR"
 chmod -R go-w "$INSTALL_DIR" # une copie depuis NTFS arrive en 777
 
 log "Python 3.12 et dépendances (uv sync --no-dev)"
-extra=()
-[[ "$WITH_WHISPER" == "1" ]] && extra+=(--extra whisper)
-[[ "$WITH_NOTEBOOKLM" == "1" ]] && extra+=(--extra notebooklm)
+# --extra notebooklm est TOUJOURS ajouté : le wheel est petit et l'omettre
+# désinstalle notebooklm-py du venv à chaque redéploiement (bug prod). --extra
+# whisper est plus lourd (faster-whisper + torch) : on ne l'ajoute que si
+# demandé — soit via WITH_WHISPER=1 (option de la commande), soit via
+# [transcript] whisper_enabled = true dans config.toml.
+extra=(--extra notebooklm)
+if [[ "$WITH_WHISPER" == "1" ]] || whisper_wanted "$INSTALL_DIR/config.toml"; then
+    extra+=(--extra whisper)
+fi
 # On passe le chemin absolu de uv dans le sub-shell : sudo -u réinitialise PATH,
 # et l'utilisateur guetteur n'a pas /usr/local/bin dans son login PATH par défaut.
 sudo -u "$SERVICE_USER" -H bash -c '
@@ -336,7 +357,7 @@ sudo -u "$SERVICE_USER" -H bash -c '
     "'"$UV_BIN"'" python install 3.12
     "'"$UV_BIN"'" sync --frozen --no-dev --python 3.12 "$@"
 ' _ "$INSTALL_DIR" "${extra[@]}"
-ok "environnement prêt ($INSTALL_DIR/.venv)"
+ok "environnement prêt ($INSTALL_DIR/.venv, extras : ${extra[*]//--extra /})"
 
 if [[ "$WITH_NOTEBOOKLM" == "1" ]]; then
     log "notebooklm-py $NLM_VERSION (uv tool sous $SERVICE_USER, wheel épinglé par hash)"
