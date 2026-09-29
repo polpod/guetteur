@@ -57,3 +57,14 @@ label = "Résumé"
 language = "fr"
 notify = "telegram"
 private = false
+
+
+[obsidian]
+enabled = true
+path = "/mnt/e/Vault/Veille"
+git_sync = true
+git_remote = "git@github.com:polpod/vault-veille.git"
+
+[applicability]
+enabled = true
+idea_threshold = 2
