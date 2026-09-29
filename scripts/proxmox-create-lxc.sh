@@ -56,6 +56,9 @@ else
     fi
 
     log "Création du conteneur $CTID ($CT_HOSTNAME) sur $STORAGE, pont $BRIDGE"
+    # firewall=1 sur net0 active le pare-feu Proxmox pour ce NIC (le fichier
+    # /etc/pve/firewall/CTID.fw écrit plus bas ne s'applique QUE si ce drapeau est
+    # posé, en plus des cases datacenter/nœud/CT).
     pct create "$CTID" "$TEMPLATE_STORAGE:vztmpl/$template" \
         --hostname "$CT_HOSTNAME" \
         --ostype debian \
@@ -65,7 +68,7 @@ else
         --memory "$MEMORY_MB" \
         --swap "$SWAP_MB" \
         --rootfs "$STORAGE:$DISK_GB" \
-        --net0 "name=eth0,bridge=$BRIDGE,ip=dhcp" \
+        --net0 "name=eth0,bridge=$BRIDGE,ip=dhcp,firewall=1" \
         --onboot 1 \
         --description "GUETTEUR : veille YouTube résumée par Claude"
 fi
@@ -95,14 +98,27 @@ pct exec "$CTID" -- env \
 # --- Pare-feu Proxmox par conteneur -------------------------------------------------
 # On écrit /etc/pve/firewall/<CTID>.fw : sortie fermée par défaut, DNS d'abord, puis
 # DROP journalisé vers le LAN, puis ACCEPT vers l'Internet (443, 22, 80, ICMP).
-# NB : on ne touche PAS aux options datacenter/nœud — l'avertissement en fin de
-# script rappelle qu'il faut Datacenter et Nœud sur Firewall = Yes ET une règle IN
-# ACCEPT du LAN vers l'hôte:8006/22 AVANT d'activer ce firewall.
+# On active aussi le drapeau firewall=1 sur net0 (indispensable pour que le .fw
+# s'applique) et on pose enable: 1 dans host.fw pour ce nœud. cluster.fw (datacenter)
+# reste manuel — l'avertissement en fin de script rappelle les règles IN ACCEPT
+# vers 8006/22 à mettre AVANT d'activer le firewall du datacenter.
 FW_DIR="/etc/pve/firewall"
 FW_FILE="$FW_DIR/${CTID}.fw"
+HOST_FW="$FW_DIR/host.fw"
 if [[ ! -d "$FW_DIR" ]]; then
     mkdir -p "$FW_DIR"
 fi
+
+# Idempotence : si le CTID existait déjà avec un net0 sans firewall=1, on l'ajoute
+# sans perdre l'existant (bridge, IP fixe éventuelle, etc.).
+if ! pct config "$CTID" | grep -qE '^net0:.*(\s|,)firewall=1(\s|,|$)'; then
+    net0_cur="$(pct config "$CTID" | awk -F': ' '/^net0:/ { print $2 }')"
+    if [[ -n "$net0_cur" ]]; then
+        log "net0 : ajout du drapeau firewall=1 (préserve : $net0_cur)"
+        pct set "$CTID" --net0 "${net0_cur},firewall=1"
+    fi
+fi
+
 log "Pare-feu Proxmox : $FW_FILE"
 cat >"$FW_FILE" <<'FW'
 [OPTIONS]
@@ -131,30 +147,42 @@ OUT ACCEPT -p icmp -log nolog           # ping/MTU discovery
 FW
 chmod 640 "$FW_FILE" 2>/dev/null || true # /etc/pve est un pmxcfs FUSE, ignorer les perms si refusées
 
+# host.fw : active le pare-feu au niveau du nœud (une des trois cases à cocher).
+# Idempotent : on ne clobber pas un host.fw existant qui aurait déjà d'autres règles.
+if [[ ! -f "$HOST_FW" ]]; then
+    log "Pare-feu Proxmox : $HOST_FW (enable: 1)"
+    cat >"$HOST_FW" <<'HOSTFW'
+[OPTIONS]
+enable: 1
+HOSTFW
+    chmod 640 "$HOST_FW" 2>/dev/null || true
+elif ! grep -qE '^enable:\s*1' "$HOST_FW"; then
+    log "Attention : $HOST_FW existe SANS « enable: 1 » — l'ajouter à la main."
+fi
+
 ip="$(pct exec "$CTID" -- hostname -I | awk '{ print $1 }')"
 log "Conteneur $CTID prêt : ${ip:-IP inconnue}. Connectez-vous : ssh root@${ip:-<ip>} (ou pct enter $CTID)"
 
 printf '\n\033[1;33m'
 cat <<'WARN'
 ╔══════════════════════════════════════════════════════════════════════════╗
-║  Pare-feu du conteneur écrit dans /etc/pve/firewall/CTID.fw.             ║
+║  Pare-feu conteneur, appliqué par ce script :                            ║
+║    • /etc/pve/firewall/CTID.fw écrit (policy DROP + règles GUETTEUR)     ║
+║    • net0 : drapeau firewall=1 posé (pct set --net0 …,firewall=1)        ║
+║    • /etc/pve/firewall/host.fw écrit avec « enable: 1 » (nœud)           ║
 ║                                                                          ║
-║  Il ne s'applique PAS tant que ces trois conditions ne sont pas          ║
-║  toutes remplies dans Proxmox :                                          ║
+║  Reste MANUEL dans Datacenter → Firewall :                               ║
+║    • « Firewall = Yes » (cluster.fw), qui active TOUT le pare-feu        ║
 ║                                                                          ║
-║    1. Datacenter → Firewall → « Firewall » sur Yes.                      ║
-║    2. Nœud       → Firewall → « Firewall » sur Yes.                      ║
-║    3. Conteneur  → Firewall → « Firewall » sur Yes.                      ║
-║                                                                          ║
-║  AVANT d'activer le firewall du datacenter, ajoutez une règle IN         ║
-║  ACCEPT depuis votre LAN vers l'hôte, sinon vous perdez l'accès à        ║
-║  Proxmox et à SSH :                                                      ║
+║  AVANT de cocher « Firewall = Yes » au niveau datacenter, cluster.fw     ║
+║  DOIT contenir des règles IN ACCEPT depuis vos sous-réseaux d'admin,     ║
+║  sinon vous perdez l'accès à Proxmox et à SSH :                          ║
 ║                                                                          ║
 ║    Datacenter → Firewall → Add :                                         ║
 ║      Direction=in  Action=ACCEPT  Source=<votre-LAN>/24  Dport=8006      ║
 ║      Direction=in  Action=ACCEPT  Source=<votre-LAN>/24  Dport=22        ║
 ║                                                                          ║
-║  Ensuite : bash scripts/firewall-check.sh CTID   (depuis l'hôte)         ║
+║  Une fois activé : bash scripts/firewall-check.sh CTID  (depuis l'hôte)  ║
 ╚══════════════════════════════════════════════════════════════════════════╝
 WARN
 printf '\033[0m\n'

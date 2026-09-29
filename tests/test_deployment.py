@@ -208,7 +208,147 @@ def test_fw_drop_covers_all_rfc1918_ranges(fw_file: Path) -> None:
         assert cidr in joined, f"{cidr} absent des DROP LAN"
 
 
-# --- 3. shellcheck --------------------------------------------------------------------
+# --- 3. Pare-feu Proxmox : firewall=1 sur net0, host.fw enable:1 ----------------------
+
+
+def test_pct_net0_carries_firewall_flag_at_create() -> None:
+    """La création (pct create --net0 ...) DOIT poser firewall=1 sur le NIC :
+    sans lui, /etc/pve/firewall/CTID.fw n'est pas appliqué même si Datacenter
+    et Nœud ont la case cochée."""
+    src = PROXMOX_SCRIPT.read_text(encoding="utf-8")
+    match = re.search(r'--net0\s+"([^"]+)"', src)
+    assert match, "--net0 introuvable dans pct create"
+    assert "firewall=1" in match.group(1), match.group(1)
+
+
+def test_pct_set_adds_firewall_when_missing() -> None:
+    """Idempotence : sur un CTID préexistant sans firewall=1, le script doit
+    exécuter pct set --net0 en conservant la config actuelle (…,firewall=1)."""
+    src = PROXMOX_SCRIPT.read_text(encoding="utf-8")
+    # On cherche à la fois le grep de détection et l'appel pct set correspondant.
+    assert re.search(r"grep -qE '\^net0:.*.*firewall=1", src), (
+        "détection d'un net0 sans firewall=1 absente"
+    )
+    assert re.search(r'pct set "\$CTID" --net0 "\$\{?net0_cur\}?,firewall=1"', src), (
+        "pct set --net0 …,firewall=1 absent"
+    )
+
+
+def test_host_fw_written_with_enable_1() -> None:
+    """Sans host.fw enable: 1, le nœud ignore les règles CT.fw. Le script doit
+    écrire ce fichier (idempotence : seulement s'il n'existe pas déjà)."""
+    src = PROXMOX_SCRIPT.read_text(encoding="utf-8")
+    match = re.search(r"cat >\"\$HOST_FW\" <<'HOSTFW'\n(.*?)\nHOSTFW\n", src, re.DOTALL)
+    assert match, "heredoc HOSTFW introuvable"
+    body = match.group(1)
+    assert re.search(r"^\[OPTIONS\]", body, re.M)
+    assert re.search(r"^enable:\s*1\b", body, re.M)
+
+
+def test_host_fw_creation_is_idempotent() -> None:
+    """Ne clobber pas un host.fw existant qui aurait déjà des règles utilisateur."""
+    src = PROXMOX_SCRIPT.read_text(encoding="utf-8")
+    assert 'if [[ ! -f "$HOST_FW" ]]; then' in src
+
+
+# --- 4. Durcissement systemd : ProtectHome=read-only + ReadWritePaths -----------------
+
+
+DEPLOY_DIR = REPO_ROOT / "deploy"
+HARDENED_UNITS = (
+    "guetteur.service",
+    "guetteur-health.service",
+    "guetteur-nlm-refresh.service",
+)
+
+
+def _unit_directives(unit: Path) -> dict[str, list[str]]:
+    """Renvoie un dict {clé: [valeurs]} des directives [Service] (systemd
+    autorise la répétition d'une clé, notamment Environment=)."""
+    out: dict[str, list[str]] = {}
+    in_service = False
+    for raw in unit.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if line == "[Service]":
+            in_service = True
+            continue
+        if line.startswith("[") and in_service:
+            break
+        if in_service and "=" in line and not line.startswith("#"):
+            key, val = line.split("=", 1)
+            out.setdefault(key.strip(), []).append(val.strip())
+    return out
+
+
+@pytest.mark.parametrize("name", HARDENED_UNITS)
+def test_unit_protect_home_is_read_only(name: str) -> None:
+    """ProtectHome=yes masque /home/guetteur en entier — uv (~/.cache),
+    Claude Code (~/.claude) et le binaire notebooklm (~/.local) plantent
+    avec 203/EXEC ou EACCES. read-only autorise la lecture tout en
+    protégeant les autres users."""
+    directives = _unit_directives(DEPLOY_DIR / name)
+    assert directives.get("ProtectHome") == ["read-only"], directives.get("ProtectHome")
+
+
+@pytest.mark.parametrize("name", HARDENED_UNITS)
+def test_unit_read_write_paths_are_specific(name: str) -> None:
+    """ReadWritePaths énumère uniquement les chemins strictement nécessaires."""
+    directives = _unit_directives(DEPLOY_DIR / name)
+    rwp = directives.get("ReadWritePaths", [])
+    assert rwp, "ReadWritePaths absent"
+    paths = rwp[0].split()
+    expected = {
+        "/opt/guetteur/data",
+        "/home/guetteur/.claude",
+        "/home/guetteur/.claude.json",
+        "/home/guetteur/.cache",
+    }
+    assert expected <= set(paths), f"{name} manque : {expected - set(paths)}"
+
+
+@pytest.mark.parametrize("name", HARDENED_UNITS)
+def test_unit_uv_cache_dir_is_under_data(name: str) -> None:
+    """uv doit écrire son cache sous /opt/guetteur/data, sinon il tape
+    ~/.cache qui est en read-only et le sync/tool plante."""
+    directives = _unit_directives(DEPLOY_DIR / name)
+    envs = directives.get("Environment", [])
+    matches = [e for e in envs if e.startswith("UV_CACHE_DIR=")]
+    assert len(matches) == 1, envs
+    _, value = matches[0].split("=", 1)
+    assert value == "/opt/guetteur/data/.uv-cache"
+
+
+def test_install_lxc_creates_service_home_paths() -> None:
+    """install-lxc.sh doit créer .claude/, .cache/, .claude.json et le cache uv,
+    tous en propriétaire guetteur — systemd refuse de bind-mount un chemin
+    inexistant, donc l'unité ne démarre pas si le script les oublie."""
+    src = (SCRIPTS_DIR / "install-lxc.sh").read_text(encoding="utf-8")
+    # install -d (dossiers) pour .claude / .cache / .uv-cache.
+    for path_frag in (
+        r'\$service_home/\.claude"',
+        r'\$service_home/\.cache"',
+        r'\$INSTALL_DIR/data/\.uv-cache"',
+    ):
+        pattern = rf'install -d -o "\$SERVICE_USER".*{path_frag}'
+        assert re.search(pattern, src), f"install -d manquant pour {path_frag}"
+    # .claude.json : fichier JSON vide si absent.
+    assert '"$service_home/.claude.json"' in src
+    assert "printf '{}\\n' >" in src
+
+
+def test_install_lxc_installs_notebooklm_as_service_user() -> None:
+    """La régression : `uv tool install` sous root plaçait le binaire dans
+    /root/.local, illisible pour guetteur (ProtectHome=read-only). Doit
+    tourner sous sudo -u guetteur avec UV_CACHE_DIR."""
+    src = (SCRIPTS_DIR / "install-lxc.sh").read_text(encoding="utf-8")
+    assert re.search(
+        r'sudo -u "\$SERVICE_USER" -H env UV_CACHE_DIR="\$INSTALL_DIR/data/\.uv-cache"\s*\\\s*\n\s*"\$UV_BIN" tool install',
+        src,
+    ), "uv tool install doit tourner sous $SERVICE_USER avec UV_CACHE_DIR"
+    assert 'nlm_bin="/home/$SERVICE_USER/.local/bin/notebooklm"' in src
+
+
+# --- 5. shellcheck --------------------------------------------------------------------
 
 
 def _shell_scripts() -> list[Path]:

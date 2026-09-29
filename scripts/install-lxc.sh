@@ -159,6 +159,26 @@ if ! id "$SERVICE_USER" >/dev/null 2>&1; then
 fi
 ok "$(id "$SERVICE_USER")"
 
+log "Chemins inscriptibles du service (ProtectHome=read-only)"
+# Le service tourne avec ReadWritePaths=/opt/guetteur/data /home/guetteur/.claude
+# /home/guetteur/.claude.json /home/guetteur/.cache — chaque chemin DOIT exister
+# au démarrage sinon systemd refuse d'appliquer le bind-mount et l'unité échoue.
+service_home="/home/$SERVICE_USER"
+install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0700 "$service_home/.claude"
+install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0755 "$service_home/.cache"
+install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0755 "$service_home/.local"
+install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0755 "$service_home/.local/bin"
+install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0755 "$INSTALL_DIR/data"
+install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0755 "$INSTALL_DIR/data/.uv-cache"
+# .claude.json : Claude Code y écrit son état ; ReadWritePaths ne peut lier qu'un
+# chemin existant, on crée un JSON vide si le binaire n'est pas encore passé.
+if [[ ! -e "$service_home/.claude.json" ]]; then
+    install -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0600 /dev/null "$service_home/.claude.json"
+    printf '{}\n' >"$service_home/.claude.json"
+    chown "$SERVICE_USER:$SERVICE_USER" "$service_home/.claude.json"
+fi
+ok "$service_home/.claude, .claude.json, .cache, $INSTALL_DIR/data/.uv-cache (owner $SERVICE_USER)"
+
 if [[ "$WITH_VAULT" == "1" ]]; then
     log "Vault Obsidian ($VAULT_REMOTE)"
     ssh_dir="/home/$SERVICE_USER/.ssh"
@@ -319,7 +339,7 @@ sudo -u "$SERVICE_USER" -H bash -c '
 ok "environnement prêt ($INSTALL_DIR/.venv)"
 
 if [[ "$WITH_NOTEBOOKLM" == "1" ]]; then
-    log "notebooklm-py $NLM_VERSION (uv tool, wheel épinglé par hash, sans extra)"
+    log "notebooklm-py $NLM_VERSION (uv tool sous $SERVICE_USER, wheel épinglé par hash)"
     # Contraintes uv : version + hash sha256 audité. Wheel seulement (--no-sources
     # empêche toute source-dist qui exécuterait le hook de build).
     nlm_constraints="$(mktemp)"
@@ -328,17 +348,24 @@ if [[ "$WITH_NOTEBOOKLM" == "1" ]]; then
     cat >"$nlm_constraints" <<EOF
 notebooklm-py==${NLM_VERSION} --hash=${NLM_HASH}
 EOF
-    # `uv tool install` crée /root/.local/share/uv/tools/notebooklm-py/ et un
-    # entrypoint dans /root/.local/bin ; on symlink dans /usr/local/bin pour le
-    # service systemd (User=guetteur n'a pas /root/.local/bin dans le PATH).
-    if ! "$UV_BIN" tool install --force --constraints "$nlm_constraints" \
+    # Le fichier de contraintes est en 0600 root:root après mktemp — le sub-shell
+    # sudo -u ne peut pas le lire. On l'ouvre en 0644 (contenu public : version + sha).
+    chmod 0644 "$nlm_constraints"
+    # Installation SOUS guetteur : sinon /usr/local/bin/notebooklm pointerait dans
+    # /root/.local/share/uv/tools/, inaccessible au service (203/EXEC + ProtectHome).
+    # UV_CACHE_DIR dédié pour ne pas cracher dans /home/guetteur/.cache (que le
+    # service voit en lecture seule à travers ProtectHome=read-only).
+    if ! sudo -u "$SERVICE_USER" -H env UV_CACHE_DIR="$INSTALL_DIR/data/.uv-cache" \
+        "$UV_BIN" tool install --force --constraints "$nlm_constraints" \
         "notebooklm-py==${NLM_VERSION}" >/dev/null; then
         die "installation de notebooklm-py $NLM_VERSION en échec (hash sha256 ?)."
     fi
-    nlm_bin="$("$UV_BIN" tool dir)/notebooklm-py/bin/notebooklm"
+    # uv tool install place l'entry point dans ~/.local/bin ; on symlink pour le
+    # PATH du service (qui ne connaît que /usr/local/bin:/usr/bin:/bin).
+    nlm_bin="/home/$SERVICE_USER/.local/bin/notebooklm"
     [[ -x "$nlm_bin" ]] || die "notebooklm introuvable après uv tool install ($nlm_bin)"
     ln -sf "$nlm_bin" /usr/local/bin/notebooklm
-    ok "$(/usr/local/bin/notebooklm --version 2>&1 | head -1)"
+    ok "$(sudo -u "$SERVICE_USER" -H /usr/local/bin/notebooklm --version 2>&1 | head -1)"
     # NOTEBOOKLM_HOME dédié, 0700, possédé par guetteur.
     install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0700 "$INSTALL_DIR/data/nlm"
     ok "$INSTALL_DIR/data/nlm (0700, $SERVICE_USER)"

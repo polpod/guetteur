@@ -233,18 +233,38 @@ L'unité `deploy/guetteur.service` lance `uv run --no-sync guetteur run` sous l'
 
 ## Déploiement complet (LXC + vault + pare-feu + durcissement)
 
-Séquence de bout en bout pour un déploiement production sur Proxmox. Chaque étape
+Séquence réellement jouée pour un déploiement production sur Proxmox. Chaque étape
 est **idempotente** : ré-exécuter le script n'endommage rien.
 
-### 1. Créer le conteneur et pousser le pare-feu (hôte Proxmox, root)
+### 1. Créer le conteneur, installer, poser le pare-feu (hôte Proxmox, root)
+
+**Une seule commande.** Ne mettez pas d'appui sur `Entrée` d'avance : `install-lxc.sh`
+demande une frappe pour valider que la deploy key du vault a été ajoutée à GitHub
+(étape 2). Un `Entrée` en tampon la consomme et le clone du vault échoue.
 
 ```bash
 git clone https://github.com/polpod/guetteur.git /root/guetteur   # ou scp -r
 bash /root/guetteur/scripts/proxmox-create-lxc.sh 120 local-lvm vmbr0
 ```
 
-Le script fait, dans l'ordre : création LXC non privilégié → attente réseau →
-`pct exec install-lxc.sh` → écriture de `/etc/pve/firewall/120.fw` avec :
+Le script fait, dans l'ordre :
+
+1. Création LXC non privilégié (`--net0 …,firewall=1` posé dès `pct create`).
+2. Démarrage + attente DHCP/DNS.
+3. `pct push` de `install-lxc.sh` puis `pct exec` : paquets système, `locales`
+   fr_FR/en_US, `uv` (chemin absolu `/usr/local/bin/uv`), Node.js 22, Claude
+   Code, utilisateur `guetteur` avec `.claude/`, `.claude.json`, `.cache/` et
+   `data/.uv-cache/` prêts (indispensables à `ReadWritePaths` du service).
+4. Génération de la clé SSH `guetteur` et **prompt deploy key** (§2 ci-dessous).
+5. Clone du dépôt, `uv sync --frozen --no-dev`, éventuel `notebooklm-py` (installé
+   **sous `guetteur`**, symlink `/usr/local/bin/notebooklm` → `/home/guetteur/.local/bin/notebooklm`).
+6. Installation des trois unités systemd, désactivées tant que `.env` et la
+   session Claude ne sont pas prêtes.
+7. Sur l'hôte : `pct set --net0 …,firewall=1` (idempotence si le CTID existait
+   déjà), écriture de `/etc/pve/firewall/120.fw` (policy DROP + règles GUETTEUR)
+   et de `/etc/pve/firewall/host.fw` (`enable: 1`).
+
+Résumé du `120.fw` écrit :
 
 ```
 policy_in : DROP    policy_out : DROP    log_level : info
@@ -253,14 +273,13 @@ OUT DROP   192.168.0.0/16, 10.0.0.0/8, 172.16.0.0/12  (LAN, journalisé)
 OUT ACCEPT tcp 443, 22, 80  +  icmp
 ```
 
-**Important — sans ces trois cases cochées, le pare-feu ne s'applique pas :**
+**Reste manuel dans l'UI Proxmox pour activer le pare-feu :**
 
-1. Datacenter → Firewall → **Firewall = Yes** ;
-2. Nœud → Firewall → **Firewall = Yes** ;
-3. Conteneur 120 → Firewall → **Firewall = Yes**.
+- Datacenter → Firewall → **Firewall = Yes** (`cluster.fw`).
 
-**Avant** d'activer le firewall du datacenter, ouvrez au moins ces règles IN, sinon
-vous perdez l'accès à Proxmox et à SSH :
+**AVANT** de cocher cette case, `cluster.fw` doit contenir des règles IN
+ACCEPT depuis vos sous-réseaux d'administration, sinon vous perdez l'accès à
+Proxmox et à SSH :
 
 ```
 Datacenter → Firewall → Add :
@@ -268,31 +287,41 @@ Datacenter → Firewall → Add :
   Direction=in  Action=ACCEPT  Source=<LAN>/24  Dport=22    # SSH hôte
 ```
 
-### 2. Ajouter la deploy key du vault (dans le conteneur, prompt de install-lxc.sh)
+Le drapeau `firewall=1` sur `net0` et `host.fw enable: 1` sont déjà posés par
+le script — pas besoin de cocher la case « Firewall » côté conteneur ni côté
+nœud dans l'UI.
+
+### 2. Ajouter la deploy key du vault (prompt de `install-lxc.sh`)
 
 Pendant `install-lxc.sh`, une clé ed25519 est générée pour l'utilisateur `guetteur`
-et sa clé publique est affichée. Ajoutez-la sur GitHub :
+et sa clé publique est affichée. Ajoutez-la sur GitHub, dans un autre terminal :
 
 - `https://github.com/polpod/vault-veille/settings/keys/new`
 - **Title** : `guetteur (<hostname>)`  •  **Key** : la ligne `ssh-ed25519 …`
 - Cocher **Allow write access**.
 
-Appuyez sur `ENTRÉE` : le vault est cloné dans `/opt/guetteur/data/vault`
-(`user.name = GUETTEUR`, `user.email = guetteur@localhost` définis dans le clone
-uniquement, pas en global).
+Appuyez sur `ENTRÉE` **dans le terminal où tourne le script** : le vault est
+cloné dans `/opt/guetteur/data/vault` (`user.name = GUETTEUR`,
+`user.email = guetteur@localhost` définis dans le clone uniquement, pas en global).
 
-Si vous relancez `install-lxc.sh` plus tard, la clé existe déjà et le prompt
-ne réapparaît pas.
+Si vous relancez `install-lxc.sh` plus tard, la clé est déjà en place et le prompt
+ne réapparaît pas (idempotence).
 
-### 3. Pousser `.env` et le profil NotebookLM (depuis votre PC)
+### 3. Pousser `.env`, `config.toml` et le profil NotebookLM (depuis votre PC)
 
 ```bash
 # .env : jetons Telegram uniquement (claude_code n'a pas besoin d'ANTHROPIC_API_KEY).
-scp .env root@<ip-lxc>:/root/.env
-pct exec 120 -- install -m 600 -o guetteur -g guetteur /root/.env /opt/guetteur/.env
+pct push 120 .env /opt/guetteur/.env
+pct exec 120 -- chown guetteur:guetteur /opt/guetteur/.env
+pct exec 120 -- chmod 0600 /opt/guetteur/.env
+
+# config.toml : playlists, canaux de notification, options archive/vault.
+pct push 120 config.toml /opt/guetteur/config.toml
+pct exec 120 -- chown guetteur:guetteur /opt/guetteur/config.toml
 
 # Profil NotebookLM déjà connecté (facultatif, seulement si archive.enabled = true).
-scp -r ~/.guetteur-nlm/* root@<ip-lxc>:/opt/guetteur/data/nlm/
+# Le dossier /opt/guetteur/data/nlm a déjà été créé en 0700 par install-lxc.sh.
+tar -C ~/.guetteur-nlm -cf - . | pct exec 120 -- tar -C /opt/guetteur/data/nlm -xf -
 pct exec 120 -- chown -R guetteur:guetteur /opt/guetteur/data/nlm
 pct exec 120 -- chmod 0700 /opt/guetteur/data/nlm
 ```
@@ -304,6 +333,9 @@ pct enter 120
 sudo -u guetteur -i claude auth login    # ouvre une URL, coller le code
 sudo -u guetteur -i claude auth status   # "loggedIn": true
 ```
+
+La session vit dans `/home/guetteur/.claude/` — déjà en `ReadWritePaths` pour
+le service (voir §6, [durcissement systemd](#7-vérifier-que-le-durcissement-systemd-ne-casse-rien)).
 
 ### 5. `guetteur doctor` — toutes les lignes doivent être OK
 
@@ -333,7 +365,12 @@ pct exec 120 -- systemctl enable --now guetteur-nlm-refresh.timer   # si Noteboo
 pct exec 120 -- systemctl status guetteur --no-pager
 ```
 
-**Sur l'hôte Proxmox** (le pare-feu du conteneur doit être activé — étape 1) :
+Si `guetteur.service` sort en `203/EXEC` ou `EACCES`, c'est que
+`ProtectHome=read-only` bloque un chemin non listé : vérifiez que `install-lxc.sh`
+a bien été relancé (il crée `.claude`, `.claude.json`, `.cache` et
+`data/.uv-cache` en propriétaire `guetteur`).
+
+**Sur l'hôte Proxmox** (le pare-feu doit être activé côté datacenter — étape 1) :
 
 ```bash
 bash /root/guetteur/scripts/firewall-check.sh 120
@@ -352,7 +389,44 @@ Sortie attendue :
 Les deux dernières lignes sont `OK` **si et seulement si** la sortie LAN est bien
 bloquée par la policy `DROP`.
 
-### 7. Test avec une nouvelle vidéo
+### 7. Vérifier que le durcissement systemd ne casse rien
+
+Les trois unités (`guetteur.service`, `guetteur-health.service`,
+`guetteur-nlm-refresh.service`) appliquent le même noyau de durcissement :
+
+```
+ProtectHome=read-only
+ReadWritePaths=/opt/guetteur/data /home/guetteur/.claude /home/guetteur/.claude.json /home/guetteur/.cache
+Environment=UV_CACHE_DIR=/opt/guetteur/data/.uv-cache
+Environment=LANG=fr_FR.UTF-8   Environment=LC_ALL=fr_FR.UTF-8
+```
+
+Plus, sur `guetteur.service` : `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX`,
+`CapabilityBoundingSet=` (vide), `SystemCallFilter=@system-service`,
+`ProtectKernelModules`, `ProtectClock`, `LockPersonality`, `RestrictNamespaces`.
+
+Contrôle rapide (ces 4 commandes doivent réussir dans l'environnement du service) :
+
+```bash
+# On lance chaque outil avec exactement les mêmes contraintes que le service.
+run() { sudo systemd-run --uid=guetteur --gid=guetteur \
+    --property=ProtectHome=read-only \
+    --property=ReadWritePaths=/opt/guetteur/data\ /home/guetteur/.claude\ /home/guetteur/.claude.json\ /home/guetteur/.cache \
+    --property=RestrictAddressFamilies=AF_INET\ AF_INET6\ AF_UNIX \
+    --property=CapabilityBoundingSet= --property=SystemCallFilter=@system-service \
+    --wait --pipe --collect --quiet -- "$@"; }
+run /usr/local/bin/claude --version         # → 1.x.x
+run /usr/bin/git --version                  # → git version 2.x
+run /usr/bin/ffmpeg -version | head -1      # → ffmpeg version …
+run /usr/local/bin/notebooklm --version     # symlink vers /home/guetteur/.local/bin
+```
+
+Si l'un de ces appels renvoie `Operation not permitted` ou `EPERM`, ajouter le
+syscall manquant à `SystemCallFilter` (`journalctl _AUDIT_TYPE_NAME=SECCOMP` donne
+le nom du syscall bloqué). Aucun cas connu à ce jour : `@system-service` couvre
+Python, git, ffmpeg, yt-dlp, `claude` et `notebooklm`.
+
+### 8. Test avec une nouvelle vidéo
 
 Ajoutez une vidéo dans une playlist surveillée. Dans les 5 minutes :
 
@@ -370,33 +444,6 @@ pct exec 120 -- sudo -u guetteur -H git -C /opt/guetteur/data/vault log --onelin
 
 Et côté Telegram : le résumé arrive avec les boutons `Bref / Standard / Détaillé /
 Question / Applicable ?`.
-
-### Vérifier que le durcissement systemd ne casse rien
-
-L'unité `deploy/guetteur.service` applique : `ProtectHome=yes` +
-`ReadWritePaths=/opt/guetteur/data /home/guetteur`, `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX`,
-`CapabilityBoundingSet=` (vide), `SystemCallFilter=@system-service`,
-`ProtectKernelModules`, `ProtectClock`, `LockPersonality`, `RestrictNamespaces`.
-
-Contrôle rapide (ces 4 commandes doivent réussir dans l'environnement du service) :
-
-```bash
-# On lance chaque outil avec exactement les mêmes contraintes que le service.
-run() { sudo systemd-run --uid=guetteur --gid=guetteur \
-    --property=ProtectHome=yes --property=ReadWritePaths=/opt/guetteur/data\ /home/guetteur \
-    --property=RestrictAddressFamilies=AF_INET\ AF_INET6\ AF_UNIX \
-    --property=CapabilityBoundingSet= --property=SystemCallFilter=@system-service \
-    --wait --pipe --collect --quiet -- "$@"; }
-run /usr/local/bin/claude --version      # → 1.x.x
-run /usr/bin/git --version               # → git version 2.x
-run /usr/bin/ffmpeg -version | head -1   # → ffmpeg version …
-run /home/guetteur/.local/bin/yt-dlp --version   # ou /usr/local/bin/yt-dlp
-```
-
-Si l'un de ces appels renvoie `Operation not permitted` ou `EPERM`, ajouter le
-syscall manquant à `SystemCallFilter` (`journalctl _AUDIT_TYPE_NAME=SECCOMP` donne
-le nom du syscall bloqué). Aucun cas connu à ce jour : `@system-service` couvre
-Python, git, ffmpeg, yt-dlp et le binaire `claude`.
 
 ---
 
