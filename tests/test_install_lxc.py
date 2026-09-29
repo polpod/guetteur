@@ -30,8 +30,7 @@ INSTALL_LXC = REPO_ROOT / "scripts" / "install-lxc.sh"
 #   ecdsa   → SHA256:p2QAMXNIC1TJYWeIOttrVc98/R1BUFWu3/LiyKgUfQM
 #   rsa     → SHA256:uNiVztksCsDhcc0u9e8BujQXVUpKZIDTMczCvj3tD2s
 GH_ED25519 = (
-    "github.com ssh-ed25519 "
-    "AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl"
+    "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl"
 )
 GH_ECDSA = (
     "github.com ecdsa-sha2-nistp256 "
@@ -141,13 +140,7 @@ def test_verify_no_valid_keys_returns_nonzero(tmp_path: Path) -> None:
 
 
 def test_verify_ignores_comments_and_blank_lines() -> None:
-    payload = (
-        "# github.com:22 SSH-2.0-babeld-abc\n"
-        "\n"
-        f"{GH_ED25519}\n"
-        "# another comment\n"
-        f"{GH_RSA}\n"
-    )
+    payload = f"# github.com:22 SSH-2.0-babeld-abc\n\n{GH_ED25519}\n# another comment\n{GH_RSA}\n"
     result = _run_verify(payload)
     assert result.returncode == 0, result.stderr
     lines = _stdout_lines(result)

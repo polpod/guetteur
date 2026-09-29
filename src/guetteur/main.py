@@ -53,17 +53,18 @@ def build_pipeline(
 
     summarizer = build_summarizer(config)  # ConfigError explicite si clé API manquante
     rss = RssSource()
-    api_source: VideoSource | None = None
+    oauth_source: VideoSource | None = None
+    public_source = _build_public_source(config, store, rss)
 
     def source_for(playlist: PlaylistConfig) -> VideoSource:
-        nonlocal api_source
+        nonlocal oauth_source
         if not playlist.private:
-            return rss
-        if api_source is None:
+            return public_source
+        if oauth_source is None:
             from guetteur.sources.api import YouTubeApiSource
 
-            api_source = YouTubeApiSource(config.token_path)
-        return api_source
+            oauth_source = YouTubeApiSource(config.token_path)
+        return oauth_source
 
     whisper = (
         WhisperTranscriber(config.transcript.whisper_model)
@@ -81,6 +82,52 @@ def build_pipeline(
         detail_override=detail_override,
         claude_lock=claude_lock,
     )
+
+
+def _build_public_source(config: Config, store: Store, rss: Any) -> VideoSource:
+    """Choisit la source pour les playlists NON privées, selon config.source :
+
+    - `rss` : force RSS (comportement Lot 1/2).
+    - `api` : force la clé API (échoue clairement si YOUTUBE_API_KEY manque).
+    - `auto` (défaut) : API par clé si YOUTUBE_API_KEY présente, RSS sinon.
+
+    En mode API on encapsule dans `AdaptiveApiKeySource` qui bascule sur RSS
+    au-delà du plafond de quota et alerte Telegram aux paliers 8000/9500."""
+    from guetteur.sources.adaptive import AdaptiveApiKeySource
+    from guetteur.sources.api import YouTubeApiKeySource
+
+    api_key = config.secrets.youtube_api_key
+    mode = config.source
+    if mode == "rss" or (mode == "auto" and not api_key):
+        return rss  # type: ignore[no-any-return]
+    if mode == "api" and not api_key:
+        raise ConfigError(
+            "general.source = 'api' exige YOUTUBE_API_KEY dans .env "
+            "(ou revenez à source = 'auto' ou 'rss')."
+        )
+
+    def bump() -> None:
+        store.youtube_quota_bump(1)
+
+    api_source = YouTubeApiKeySource(api_key, on_call=bump)
+    alert: Any = None
+    if config.secrets.telegram_bot_token and config.secrets.telegram_chat_id:
+        from guetteur.notify.telegram import TelegramNotifier
+
+        notifier = TelegramNotifier(
+            config.secrets.telegram_bot_token, config.secrets.telegram_chat_id
+        )
+
+        def send_alert(text: str) -> None:
+            try:
+                from guetteur.notify.base import Message
+
+                notifier.send(Message(markdown_v2=text, plain=text, short=text))
+            except Exception:
+                log.exception("youtube_quota.alert_failed")
+
+        alert = send_alert
+    return AdaptiveApiKeySource(api_source, rss, store, alert=alert)
 
 
 def cmd_once(config: Config, detail: DetailLevel | None = None) -> int:

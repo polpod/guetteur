@@ -147,6 +147,118 @@ def check_vault(config: Config) -> list[Check]:
     return [Check("vault : remote joignable", False, f"{remote} : {err[0][:120]}")]
 
 
+def check_youtube_source(config: Config) -> list[Check]:
+    """Deux lignes :
+
+    - « youtube : source » — mode configuré (auto/rss/api) et résolution effective
+      (« api : X playlist(s), rss : Y playlist(s), oauth : Z privée(s) »).
+    - « youtube : clé API » (seulement si mode auto/api ET clé présente) — vérifie
+      qu'elle est acceptée en pingant playlistItems.list?maxResults=1 sur la
+      première playlist publique, et affiche le quota consommé du jour.
+    """
+    import httpx
+
+    from guetteur.sources.api import PLAYLIST_ITEMS_URL
+
+    api_key = config.secrets.youtube_api_key
+    mode = config.source
+    public_playlists = [p for p in config.playlists if not p.private]
+    private_playlists = [p for p in config.playlists if p.private]
+
+    if mode == "rss" or (mode == "auto" and not api_key):
+        effective = "rss"
+    elif mode == "api" and not api_key:
+        return [
+            Check(
+                "youtube : source",
+                False,
+                "general.source = 'api' mais YOUTUBE_API_KEY absente dans .env",
+            )
+        ]
+    else:
+        effective = "api"
+
+    parts = []
+    if public_playlists:
+        parts.append(f"{effective} : {len(public_playlists)} playlist(s)")
+    if private_playlists:
+        parts.append(f"oauth : {len(private_playlists)} privée(s)")
+    detail_source = f"{mode} → {', '.join(parts)}" if parts else f"{mode} → aucune playlist"
+    checks: list[Check] = [Check("youtube : source", True, detail_source)]
+
+    if effective != "api" or not api_key:
+        return checks
+
+    # Ping playlistItems.list : coûte 1 unité de quota, ne compte pas côté compteur
+    # local (test ponctuel, admin).
+    if not public_playlists:
+        checks.append(
+            Check(
+                "youtube : clé API",
+                True,
+                "clé présente ; aucune playlist publique à tester",
+            )
+        )
+        return checks
+    test_pid = public_playlists[0].id
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            resp = client.get(
+                PLAYLIST_ITEMS_URL,
+                params={
+                    "part": "id",
+                    "playlistId": test_pid,
+                    "maxResults": 1,
+                    "key": api_key,
+                },
+            )
+    except httpx.HTTPError as exc:
+        checks.append(Check("youtube : clé API", False, f"réseau : {exc}"))
+        return checks
+    if resp.status_code == 200:
+        used = _read_quota_used(config)
+        checks.append(
+            Check(
+                "youtube : clé API",
+                True,
+                f"ping {test_pid} OK (quota consommé aujourd'hui : {used}/10000)",
+            )
+        )
+        return checks
+    if resp.status_code == 403:
+        checks.append(
+            Check(
+                "youtube : clé API",
+                False,
+                f"403 : clé refusée ou quota déjà épuisé ({resp.text[:120]})",
+            )
+        )
+    elif resp.status_code == 404:
+        checks.append(
+            Check(
+                "youtube : clé API",
+                False,
+                f"404 sur {test_pid} : la playlist ne devrait pas être privée",
+            )
+        )
+    else:
+        checks.append(
+            Check("youtube : clé API", False, f"HTTP {resp.status_code} : {resp.text[:120]}")
+        )
+    return checks
+
+
+def _read_quota_used(config: Config) -> int:
+    try:
+        store = Store(config.db_path)
+    except Exception:
+        return 0
+    try:
+        return store.youtube_quota_used()
+    finally:
+        store.close()
+
+
 def check_notebooklm(config: Config, store: Store | None = None) -> list[Check]:
     """4 lignes attendues par l'utilisateur en Lot 3 : version épinglée, permissions
     du home dédié, session (auth check), compte Google. Toutes gérées sans lever."""
@@ -271,6 +383,7 @@ def run_checks(
     checks.append(check_ffmpeg(which))
     checks.append(check_database(config))
     checks += check_secrets(config)
+    checks += check_youtube_source(config)
     checks += check_vault(config)
     checks += check_notebooklm(config)
     return checks

@@ -39,6 +39,9 @@ def test_all_ok(tmp_path: Path) -> None:
         "ffmpeg",
         "base SQLite",
         "tokens Telegram",
+        # Mode source par défaut : « auto » ; clé API absente → RSS pour toutes les
+        # playlists publiques. Pas de ligne « youtube : clé API » sans clé.
+        "youtube : source",
         # Archivage désactivé par défaut : une seule ligne récapitulative.
         "notebooklm : archivage",
     ]

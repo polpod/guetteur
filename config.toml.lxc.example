@@ -3,7 +3,12 @@
 # /opt/guetteur/.env, jamais ici.
 
 [general]
-poll_interval_seconds = 300
+# "auto" (défaut) : API par clé YouTube Data v3 si YOUTUBE_API_KEY est dans .env,
+# RSS sinon (latence jusqu'à 1 h). "rss" force RSS ; "api" échoue sans clé.
+# Les playlists private = true passent toujours par l'OAuth (data/token.json).
+source = "auto"
+# En mode API, 60 s par défaut ; en mode RSS, 300 s. Décommenter pour forcer.
+# poll_interval_seconds = 60
 claude_model = "claude-sonnet-4-6"
 max_videos_per_cycle = 3
 data_dir = "data"                  # relatif à /opt/guetteur (soit /opt/guetteur/data)

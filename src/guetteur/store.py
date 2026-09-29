@@ -600,6 +600,62 @@ class Store:
         rows = self._conn.execute("SELECT status, COUNT(*) AS n FROM videos GROUP BY status")
         return {str(r["status"]): int(r["n"]) for r in rows}
 
+    # --- quota YouTube Data API (par jour PT) ----------------------------------------------
+    #
+    # Google reset le quota YouTube Data API à minuit heure du Pacifique (UTC-8/-7),
+    # pas UTC. On stocke la date PT courante et le compteur ; toute lecture après un
+    # changement de jour PT réinitialise le compteur et les drapeaux d'alerte.
+
+    def _youtube_pt_day(self, now: datetime) -> str:
+        # Approximation : Pacific = UTC-8 (heure standard). L'API est tolérante à
+        # quelques heures de décalage — le compteur peut s'écouler jusqu'à une heure
+        # avant/après minuit local. Un jour de plus ou de moins n'ouvre pas la porte
+        # à un dépassement (le hard-limit reste à 9500/10000).
+        pt = now.astimezone(UTC) - timedelta(hours=8)
+        return pt.date().isoformat()
+
+    def _youtube_quota_reset_if_new_day(self, now: datetime) -> str:
+        day = self._youtube_pt_day(now)
+        stored = self.get_meta("youtube_quota_day")
+        if stored != day:
+            self.set_meta("youtube_quota_day", day)
+            self.set_meta("youtube_quota_used", "0")
+            # Les alertes sont réarmées : nouvelle journée, nouveau plafond.
+            self._conn.execute(
+                "DELETE FROM meta WHERE key IN ('youtube_alert_8k', 'youtube_alert_9k5')"
+            )
+        return day
+
+    def youtube_quota_used(self, now: datetime | None = None) -> int:
+        """Nombre d'appels API consommés aujourd'hui (heure PT)."""
+        self._youtube_quota_reset_if_new_day(now or utcnow())
+        raw = self.get_meta("youtube_quota_used")
+        return int(raw) if raw else 0
+
+    def youtube_quota_bump(self, n: int = 1, now: datetime | None = None) -> int:
+        """Incrémente le compteur de `n` et renvoie la nouvelle valeur."""
+        current = self.youtube_quota_used(now)
+        new_value = current + n
+        self.set_meta("youtube_quota_used", str(new_value))
+        return new_value
+
+    def youtube_quota_mark_exhausted(self, hard_limit: int, now: datetime | None = None) -> None:
+        """Force le compteur au plafond dur (utilisé quand l'API renvoie 403
+        quotaExceeded : Google confirme qu'on n'a plus rien, quel que soit notre
+        compteur local, on passe en mode RSS jusqu'au prochain jour PT)."""
+        self._youtube_quota_reset_if_new_day(now or utcnow())
+        self.set_meta("youtube_quota_used", str(hard_limit))
+
+    def youtube_quota_alert_needed(self, level: str, now: datetime | None = None) -> bool:
+        """Renvoie True au premier appel de la journée pour ce niveau (« 8k » ou
+        « 9k5 »), False les suivants — permet de dé-doublonner les alertes Telegram."""
+        self._youtube_quota_reset_if_new_day(now or utcnow())
+        key = f"youtube_alert_{level}"
+        if self.get_meta(key):
+            return False
+        self.set_meta(key, _iso(now or utcnow()))
+        return True
+
     # --- bot Telegram (Lot 5) --------------------------------------------------------------
 
     def cache_summary(self, video_id: str, detail: str, summary_json: str) -> None:

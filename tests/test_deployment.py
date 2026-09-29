@@ -111,9 +111,7 @@ def test_vault_remote_unreachable_is_ko(tmp_path: Path) -> None:
     assert str(fake) in checks[0].detail
 
 
-def test_vault_ls_remote_timeout_is_ko(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_vault_ls_remote_timeout_is_ko(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = _config_with_vault(tmp_path, git_remote="git@github.com:polpod/vault-veille.git")
 
     def _timeout(*_a: Any, **_kw: Any) -> subprocess.CompletedProcess[str]:
@@ -341,10 +339,13 @@ def test_install_lxc_installs_notebooklm_as_service_user() -> None:
     /root/.local, illisible pour guetteur (ProtectHome=read-only). Doit
     tourner sous sudo -u guetteur avec UV_CACHE_DIR."""
     src = (SCRIPTS_DIR / "install-lxc.sh").read_text(encoding="utf-8")
-    assert re.search(
-        r'sudo -u "\$SERVICE_USER" -H env UV_CACHE_DIR="\$INSTALL_DIR/data/\.uv-cache"\s*\\\s*\n\s*"\$UV_BIN" tool install',
-        src,
-    ), "uv tool install doit tourner sous $SERVICE_USER avec UV_CACHE_DIR"
+    pattern = (
+        r'sudo -u "\$SERVICE_USER" -H env UV_CACHE_DIR='
+        r'"\$INSTALL_DIR/data/\.uv-cache"\s*\\\s*\n\s*"\$UV_BIN" tool install'
+    )
+    assert re.search(pattern, src), (
+        "uv tool install doit tourner sous $SERVICE_USER avec UV_CACHE_DIR"
+    )
     assert 'nlm_bin="/home/$SERVICE_USER/.local/bin/notebooklm"' in src
 
 
@@ -399,7 +400,7 @@ def test_whisper_wanted_helper_shape() -> None:
         src = script.read_text(encoding="utf-8")
         # Signature awk : section [transcript] et whisper_enabled = true.
         assert re.search(r"whisper_wanted\(\)\s*\{", src), f"{script.name} : whisper_wanted absent"
-        assert 'section ~ /^\\[transcript\\]/' in src, (
+        assert "section ~ /^\\[transcript\\]/" in src, (
             f"{script.name} : awk cherche la mauvaise section"
         )
         assert "whisper_enabled" in src
@@ -421,6 +422,4 @@ def test_shellcheck_clean(script: Path) -> None:
         text=True,
         check=False,
     )
-    assert proc.returncode == 0, (
-        f"shellcheck sur {script.name} :\n{proc.stdout}\n{proc.stderr}"
-    )
+    assert proc.returncode == 0, f"shellcheck sur {script.name} :\n{proc.stdout}\n{proc.stderr}"

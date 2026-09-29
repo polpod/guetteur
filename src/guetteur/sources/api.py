@@ -1,11 +1,19 @@
-"""Source YouTube Data API v3 + OAuth, pour les playlists privées (playlist.private = true).
+"""Sources YouTube Data API v3.
 
-Le jeton OAuth est stocké dans data/token.json ; il est créé une fois par `guetteur auth`
-à partir de data/client_secret.json (identifiants OAuth « application de bureau »)."""
+Deux variantes :
+
+- `YouTubeApiSource` (OAuth) : pour les playlists privées (playlist.private = true).
+  Le jeton OAuth est stocké dans data/token.json ; il est créé une fois par
+  `guetteur auth` à partir de data/client_secret.json.
+- `YouTubeApiKeySource` (clé API) : pour les playlists publiques et non répertoriées.
+  Nécessite YOUTUBE_API_KEY dans .env. Détection en 60 s au lieu de l'heure de latence
+  du flux RSS ; consomme 1 unité de quota par appel `playlistItems.list`.
+"""
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -21,6 +29,15 @@ log = logging.getLogger(__name__)
 
 SCOPES = ["https://www.googleapis.com/auth/youtube.readonly"]
 PLAYLIST_ITEMS_URL = "https://www.googleapis.com/youtube/v3/playlistItems"
+
+
+class QuotaExceededError(SourceError):
+    """Levée quand Google renvoie 403 quotaExceeded : la journée est cuite,
+    l'appelant (AdaptiveApiKeySource) doit basculer sur RSS."""
+
+
+class PlaylistNotFoundError(SourceError):
+    """404 : la playlist n'existe pas, est privée, ou l'ID est mal formé."""
 
 
 def run_oauth_flow(
@@ -130,4 +147,87 @@ class YouTubeApiSource:
         videos = parse_items(items[: self._max_items])
         # Les playlists sont ordonnées par position ; on veut les plus récentes d'abord.
         videos.sort(key=lambda v: v.published.timestamp() if v.published else 0.0, reverse=True)
+        return videos
+
+
+def _extract_error_reason(resp: httpx.Response) -> str:
+    """Renvoie le champ `reason` de la première erreur Google, ou une chaîne vide."""
+    try:
+        payload = resp.json()
+    except ValueError:
+        return ""
+    err = payload.get("error", {}) if isinstance(payload, dict) else {}
+    errors = err.get("errors") if isinstance(err, dict) else None
+    if isinstance(errors, list) and errors:
+        first = errors[0]
+        if isinstance(first, dict):
+            return str(first.get("reason", ""))
+    return str(err.get("status", "")) if isinstance(err, dict) else ""
+
+
+class YouTubeApiKeySource:
+    """`playlistItems.list` par clé API (public / non répertorié). Un appel HTTP
+    = 1 unité de quota Google ; l'appelant enregistre la consommation via `on_call`."""
+
+    def __init__(
+        self,
+        api_key: str,
+        client: httpx.Client | None = None,
+        max_items: int = 50,
+        on_call: Callable[[], None] | None = None,
+    ) -> None:
+        if not api_key:
+            raise SourceError("YOUTUBE_API_KEY vide : pas de source API par clé")
+        self._api_key = api_key
+        self._client = client or httpx.Client(timeout=20.0)
+        self._max_items = max_items
+        self._on_call = on_call or (lambda: None)
+
+    def fetch(self, playlist_id: str) -> list[Video]:
+        items: list[dict[str, Any]] = []
+        page_token: str | None = None
+        while len(items) < self._max_items:
+            params: dict[str, str | int] = {
+                "part": "snippet,contentDetails",
+                "playlistId": playlist_id,
+                "maxResults": 50,
+                "key": self._api_key,
+            }
+            if page_token:
+                params["pageToken"] = page_token
+            try:
+                resp = self._client.get(PLAYLIST_ITEMS_URL, params=params)
+            except httpx.HTTPError as exc:
+                raise SourceError(
+                    f"YouTube Data API (clé) : échec réseau pour {playlist_id} : {exc}"
+                ) from exc
+            # On enregistre l'appel dès qu'il est parti — même en cas de 403 quota,
+            # Google l'a compté côté serveur.
+            self._on_call()
+            if resp.status_code == 403:
+                reason = _extract_error_reason(resp)
+                if reason in ("quotaExceeded", "dailyLimitExceeded", "rateLimitExceeded"):
+                    raise QuotaExceededError(f"YouTube Data API : quota épuisé ({reason})")
+                raise SourceError(f"YouTube Data API : 403 {reason or 'refus'} sur {playlist_id}")
+            if resp.status_code == 404:
+                raise PlaylistNotFoundError(
+                    f"YouTube Data API : playlist introuvable ({playlist_id})"
+                )
+            try:
+                resp.raise_for_status()
+            except httpx.HTTPError as exc:
+                raise SourceError(
+                    f"YouTube Data API (clé) : {resp.status_code} sur {playlist_id} : {exc}"
+                ) from exc
+            data: dict[str, Any] = resp.json()
+            items.extend(data.get("items", []))
+            page_token = data.get("nextPageToken")
+            if not page_token:
+                break
+        videos = parse_items(items[: self._max_items])
+        videos.sort(key=lambda v: v.published.timestamp() if v.published else 0.0, reverse=True)
+        log.debug(
+            "youtube_api_key.fetched",
+            extra={"playlist_id": playlist_id, "count": len(videos)},
+        )
         return videos

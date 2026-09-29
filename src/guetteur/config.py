@@ -14,10 +14,20 @@ NotifyChannel = Literal["telegram", "whatsapp"]
 _CHANNELS: tuple[NotifyChannel, ...] = ("telegram", "whatsapp")
 SummarizeProvider = Literal["claude_code", "claude_api"]
 _PROVIDERS: tuple[SummarizeProvider, ...] = ("claude_code", "claude_api")
+# Mode de découverte des vidéos (par défaut auto : API si YOUTUBE_API_KEY présente
+# pour les playlists publiques/non répertoriées, RSS sinon ; OAuth reste pour les
+# playlists private=true, indépendamment du mode).
+SourceMode = Literal["auto", "rss", "api"]
+_SOURCES: tuple[SourceMode, ...] = ("auto", "rss", "api")
 
-DEFAULT_POLL_INTERVAL = 300
+# RSS met jusqu'à 1 h à refléter un ajout ; l'API par clé descend à 60 s.
+DEFAULT_POLL_INTERVAL_RSS = 300
+DEFAULT_POLL_INTERVAL_API = 60
 DEFAULT_MODEL = "claude-sonnet-4-6"
 DEFAULT_MAX_VIDEOS_PER_CYCLE = 3
+# Rétro-compatibilité : ancienne valeur exportée. Certains tests/consommateurs
+# externes lisent ce nom ; on garde l'alias sur la valeur RSS.
+DEFAULT_POLL_INTERVAL = DEFAULT_POLL_INTERVAL_RSS
 
 
 class ConfigError(ValueError):
@@ -154,6 +164,9 @@ class Secrets:
     wa_token: str = ""
     wa_phone_id: str = ""
     wa_to: str = ""
+    # Clé YouTube Data API v3 (playlistItems.list par clé, sans OAuth). Utilisée
+    # pour toutes les playlists non privées lorsque general.source = "auto" ou "api".
+    youtube_api_key: str = ""
 
     @classmethod
     def from_env(cls) -> Secrets:
@@ -164,17 +177,20 @@ class Secrets:
             wa_token=os.environ.get("WA_TOKEN", ""),
             wa_phone_id=os.environ.get("WA_PHONE_ID", ""),
             wa_to=os.environ.get("WA_TO", ""),
+            youtube_api_key=os.environ.get("YOUTUBE_API_KEY", ""),
         )
 
 
 @dataclass(frozen=True)
 class Config:
     playlists: tuple[PlaylistConfig, ...]
-    poll_interval_seconds: int = DEFAULT_POLL_INTERVAL
+    poll_interval_seconds: int = DEFAULT_POLL_INTERVAL_RSS
     claude_model: str = DEFAULT_MODEL
     max_videos_per_cycle: int = DEFAULT_MAX_VIDEOS_PER_CYCLE
     data_dir: Path = Path("data")
     log_level: str = "INFO"
+    # Choix explicite de la source de découverte (auto = décide par playlist).
+    source: SourceMode = "auto"
     transcript: TranscriptConfig = field(default_factory=TranscriptConfig)
     summarize: SummarizeConfig = field(default_factory=SummarizeConfig)
     notify: NotifyConfig = field(default_factory=NotifyConfig)
@@ -400,10 +416,34 @@ def parse_config(data: dict[str, Any], secrets: Secrets | None = None) -> Config
     if len(ids) != len(set(ids)):
         raise ConfigError("Identifiants de playlist en double dans config.toml")
 
+    source_raw = general.get("source", "auto")
+    if source_raw not in _SOURCES:
+        raise ConfigError(
+            f"general.source doit valoir 'auto', 'rss' ou 'api' (reçu : {source_raw!r})"
+        )
+    # Comparaison explicite plutôt que cast : rétrécit le type sans dépendre du
+    # narrowing mypy sur `in <tuple>`.
+    source_mode: SourceMode
+    if source_raw == "api":
+        source_mode = "api"
+    elif source_raw == "rss":
+        source_mode = "rss"
+    else:
+        source_mode = "auto"
+
+    effective_secrets = secrets if secrets is not None else Secrets.from_env()
+    # Défaut du poll_interval : 60 s si la source effective est susceptible d'être
+    # l'API (auto avec clé, ou "api" forcé), 300 s sinon. Un poll_interval_seconds
+    # explicite dans config.toml a toujours priorité.
+    api_capable = source_mode == "api" or (
+        source_mode == "auto" and bool(effective_secrets.youtube_api_key)
+    )
+    default_poll = DEFAULT_POLL_INTERVAL_API if api_capable else DEFAULT_POLL_INTERVAL_RSS
+
     return Config(
         playlists=playlists,
         poll_interval_seconds=_positive_int(
-            general.get("poll_interval_seconds", DEFAULT_POLL_INTERVAL), "poll_interval_seconds"
+            general.get("poll_interval_seconds", default_poll), "poll_interval_seconds"
         ),
         claude_model=str(general.get("claude_model", DEFAULT_MODEL)),
         max_videos_per_cycle=_positive_int(
@@ -412,6 +452,7 @@ def parse_config(data: dict[str, Any], secrets: Secrets | None = None) -> Config
         ),
         data_dir=Path(str(general.get("data_dir", "data"))),
         log_level=str(general.get("log_level", "INFO")).upper(),
+        source=source_mode,
         transcript=TranscriptConfig(
             languages=tuple(str(x) for x in tr.get("languages", ["fr", "en"])),
             whisper_enabled=bool(tr.get("whisper_enabled", False)),
@@ -430,7 +471,7 @@ def parse_config(data: dict[str, Any], secrets: Secrets | None = None) -> Config
         archive=_parse_archive(data.get("archive", {})),
         obsidian=_parse_obsidian(data.get("obsidian", {})),
         applicability=_parse_applicability(data.get("applicability", {})),
-        secrets=secrets if secrets is not None else Secrets.from_env(),
+        secrets=effective_secrets,
     )
 
 
