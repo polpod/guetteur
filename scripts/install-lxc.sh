@@ -108,14 +108,16 @@ export DEBIAN_FRONTEND=noninteractive
 
 log "Paquets système"
 missing=()
-for pkg in ca-certificates curl git ffmpeg sudo gnupg locales openssh-client; do
+for pkg in \
+    ca-certificates curl git ffmpeg sudo gnupg locales openssh-client \
+    pandoc fonts-dejavu texlive-xetex texlive-fonts-recommended; do
     dpkg -s "$pkg" >/dev/null 2>&1 || missing+=("$pkg")
 done
 if ((${#missing[@]})); then
     apt-get update -q
     apt-get install -y -q --no-install-recommends "${missing[@]}"
 fi
-ok "git $(git --version | awk '{ print $3 }'), curl, ffmpeg, locales"
+ok "git $(git --version | awk '{ print $3 }'), curl, ffmpeg, pandoc, DejaVu, locales"
 
 log "Locales fr_FR.UTF-8 et en_US.UTF-8"
 # `locale -a` sort du fr_FR.utf8 ou fr_FR.UTF-8 selon les versions — on compare sans

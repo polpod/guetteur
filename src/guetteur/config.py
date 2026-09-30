@@ -136,6 +136,29 @@ class ObsidianConfig:
 
 
 @dataclass(frozen=True)
+class LivreConfig:
+    # Lot 7 : compilation d'une chaîne YouTube en ebook. Les valeurs par défaut
+    # protègent contre les débordements — une chaîne bavarde peut aligner plus
+    # de 1000 vidéos, ce qui coûterait plusieurs heures de Claude.
+    max_videos_default: int = 150
+    detail_default: DetailLevel = "standard"
+    # Attente entre deux vidéos (secondes). Évite de saturer les APIs YouTube et
+    # laisse au bot le temps d'intercaler les cycles de veille (verrou Claude).
+    pause_between_videos_s: float = 5.0
+    # Sur usage_limit Claude, on suspend le job et on reprend 1 h plus tard. Passer
+    # à false pour tenter en boucle (déconseillé : consomme un essai à chaque cycle).
+    stop_on_usage_limit: bool = True
+    # Cadence des messages d'avancement Telegram (toutes les N vidéos résumées).
+    progress_every: int = 10
+    # Minutes d'attente après un usage_limit avant reprise automatique.
+    usage_limit_backoff_min: int = 60
+    # Estimation Claude par vidéo (minutes) affichée dans le plan avant confirmation.
+    estimated_minutes_per_video: float = 4.0
+    # NotebookLM : archive optionnelle du livre + vidéos en sources (rotation ≥ 50).
+    notebooklm: bool = False
+
+
+@dataclass(frozen=True)
 class ApplicabilityConfig:
     # Seconde passe Claude qui score chaque projet chargé face au résumé détaillé.
     enabled: bool = True
@@ -208,6 +231,7 @@ class Config:
     archive: ArchiveConfig = field(default_factory=ArchiveConfig)
     obsidian: ObsidianConfig = field(default_factory=ObsidianConfig)
     applicability: ApplicabilityConfig = field(default_factory=ApplicabilityConfig)
+    livre: LivreConfig = field(default_factory=LivreConfig)
     secrets: Secrets = field(default_factory=Secrets)
 
     @property
@@ -423,9 +447,55 @@ _SECTIONS = frozenset(
         "archive",
         "obsidian",
         "applicability",
+        "livre",
         "playlists",
     }
 )
+
+
+def _parse_livre(raw: dict[str, Any]) -> LivreConfig:
+    default = LivreConfig()
+    detail_default = str(raw.get("detail_default", default.detail_default))
+    if detail_default not in DETAIL_LEVELS:
+        raise ConfigError(
+            f"livre.detail_default doit valoir {', '.join(repr(d) for d in DETAIL_LEVELS)} "
+            f"(reçu : {detail_default!r})"
+        )
+    pause = raw.get("pause_between_videos_s", default.pause_between_videos_s)
+    if isinstance(pause, bool) or not isinstance(pause, int | float) or pause < 0:
+        raise ConfigError(
+            f"livre.pause_between_videos_s doit être un nombre positif (reçu : {pause!r})"
+        )
+    estimated = raw.get("estimated_minutes_per_video", default.estimated_minutes_per_video)
+    if isinstance(estimated, bool) or not isinstance(estimated, int | float) or estimated <= 0:
+        raise ConfigError(
+            f"livre.estimated_minutes_per_video doit être > 0 (reçu : {estimated!r})"
+        )
+    detail_value: DetailLevel = (
+        "bref"
+        if detail_default == "bref"
+        else "detaille"
+        if detail_default == "detaille"
+        else "standard"
+    )
+    return LivreConfig(
+        max_videos_default=_positive_int(
+            raw.get("max_videos_default", default.max_videos_default),
+            "livre.max_videos_default",
+        ),
+        detail_default=detail_value,
+        pause_between_videos_s=float(pause),
+        stop_on_usage_limit=bool(raw.get("stop_on_usage_limit", default.stop_on_usage_limit)),
+        progress_every=_positive_int(
+            raw.get("progress_every", default.progress_every), "livre.progress_every"
+        ),
+        usage_limit_backoff_min=_positive_int(
+            raw.get("usage_limit_backoff_min", default.usage_limit_backoff_min),
+            "livre.usage_limit_backoff_min",
+        ),
+        estimated_minutes_per_video=float(estimated),
+        notebooklm=bool(raw.get("notebooklm", default.notebooklm)),
+    )
 
 
 def parse_config(data: dict[str, Any], secrets: Secrets | None = None) -> Config:
@@ -496,6 +566,7 @@ def parse_config(data: dict[str, Any], secrets: Secrets | None = None) -> Config
         archive=_parse_archive(data.get("archive", {})),
         obsidian=_parse_obsidian(data.get("obsidian", {})),
         applicability=_parse_applicability(data.get("applicability", {})),
+        livre=_parse_livre(data.get("livre", {})),
         secrets=effective_secrets,
     )
 

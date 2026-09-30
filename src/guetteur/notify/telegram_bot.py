@@ -18,6 +18,7 @@ from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any, cast
 
 import httpx
@@ -138,6 +139,40 @@ class TelegramApi:
         if text:
             payload["text"] = text[:200]  # Telegram limite l'aperçu à 200 caractères
         self._post("answerCallbackQuery", payload)
+
+    def send_document(
+        self, chat_id: str, path: Path, caption: str | None = None
+    ) -> int | None:
+        """Envoie un fichier local via `sendDocument` (multipart). Utilisé par le
+        Lot 7 pour livrer livre.md / livre.epub / livre.pdf en fin de génération.
+        Retourne le message_id ou None."""
+        if not path.exists():
+            raise TelegramApiError(f"sendDocument : fichier absent {path}")
+        try:
+            with path.open("rb") as fh:
+                files = {"document": (path.name, fh)}
+                data: dict[str, Any] = {"chat_id": chat_id}
+                if caption:
+                    data["caption"] = caption[:1024]
+                resp = self._client.post(
+                    f"{self._base}/sendDocument", data=data, files=files, timeout=180.0
+                )
+        except httpx.HTTPError as exc:
+            raise TelegramApiError(f"sendDocument : {type(exc).__name__}") from exc
+        try:
+            body = resp.json()
+        except ValueError:
+            body = {}
+        if resp.status_code != 200 or not body.get("ok"):
+            raise TelegramApiError(
+                f"sendDocument HTTP {resp.status_code} : "
+                f"{body.get('description') or resp.text[:200]}"
+            )
+        result = body.get("result")
+        if isinstance(result, dict):
+            mid = result.get("message_id")
+            return int(mid) if isinstance(mid, int) else None
+        return None
 
 
 # --- callback_data ---------------------------------------------------------------------
@@ -740,7 +775,50 @@ class TelegramBot:
         if cmd == "/idees":
             self._cmd_ideas(args)
             return
+        if cmd == "/livre":
+            self._cmd_livre_create(args)
+            return
+        if cmd == "/livres":
+            self._cmd_livres_list()
+            return
         self._send_plain(f"Commande inconnue : {cmd}. /help pour la liste.")
+
+    def _cmd_livre_create(self, args: list[str]) -> None:
+        """`/livre <URL>` : crée un job livre à partir d'une URL de chaîne, avec
+        les valeurs par défaut de config (`[livre] max_videos_default`,
+        `detail_default`). Aucun filtre avancé côté bot — pour --min-duration,
+        --since, etc. l'utilisateur passe par la CLI. Le job n'est PAS lancé
+        automatiquement : le bot renvoie l'estimation et attend la confirmation
+        via `/livre run <id>` (délégué à la CLI dans un terminal)."""
+        if not args:
+            self._send_plain(
+                "Usage : /livre <URL de chaîne>\n"
+                "Ensuite : `guetteur livre run <id>` depuis un terminal pour lancer."
+            )
+            return
+        if self._store.has_running_livre():
+            self._send_plain("Un livre est déjà en cours. `/livres` pour voir l'état.")
+            return
+        url = args[0]
+        try:
+            from guetteur.jobs.livre import persist_new_livre, plan_book
+            from guetteur.sources.channel import ChannelFilters
+
+            filters = ChannelFilters(max_videos=self._config.livre.max_videos_default)
+            plan = plan_book(self._config, url, title=None, filters=filters)
+            livre_id = persist_new_livre(self._store, plan, url)
+        except Exception as exc:
+            self._send_plain(f"Création du livre en échec : {type(exc).__name__} — {exc}")
+            return
+        self._send_plain(
+            f"Livre {livre_id} créé.\n\n{plan.render()}\n\n"
+            f"Pour lancer : `guetteur livre run {livre_id}`"
+        )
+
+    def _cmd_livres_list(self) -> None:
+        from guetteur.jobs.livre import list_livres_text
+
+        self._send_plain(list_livres_text(self._store))
 
     def _cmd_ideas(self, args: list[str]) -> None:
         """`/idees <projet>` : renvoie les 5 dernières entrées de Projets/<projet>/IDEES.md.
@@ -951,6 +1029,8 @@ class TelegramBot:
             "/projets — liste les fiches projet chargées\n"
             "/applicabilite <id> — relance la seconde passe Claude\n"
             "/idees <projet> — 5 dernières entrées de Projets/<projet>/IDEES.md\n"
+            "/livre <URL> — crée un job de compilation d'une chaîne YouTube en ebook\n"
+            "/livres — liste les livres en base et leur état\n"
             "/help — cette aide\n\n"
             "Réponds à n'importe quel message de résumé pour poser une question sur la vidéo, "
             "ou utilise le bouton « Question »."

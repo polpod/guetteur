@@ -74,6 +74,17 @@ statuts = ["actif", "pause"]
 # que vous voulez que tout parte à chaque fois.
 max_projects = 20
 
+[livre]
+# Lot 7 : compilation d'une chaîne YouTube en ebook (`guetteur livre create`).
+max_videos_default = 150
+detail_default = "standard"
+pause_between_videos_s = 5.0
+stop_on_usage_limit = true
+progress_every = 10
+usage_limit_backoff_min = 60
+estimated_minutes_per_video = 4.0
+notebooklm = false
+
 # Une section [[playlists]] par playlist surveillée.
 
 [[playlists]]

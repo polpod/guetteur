@@ -24,10 +24,11 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
+from typing import Any
 
 from guetteur.models import Video
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 class Status(StrEnum):
@@ -148,6 +149,46 @@ CREATE TABLE IF NOT EXISTS ideas_written (
     at           TEXT NOT NULL,
     PRIMARY KEY (video_id, project_slug)
 );
+-- Lot 7 : jobs de compilation d'une chaîne YouTube en ebook. L'état d'un job
+-- (pending/running/paused/done/failed/cancelled) survit à un crash — voir
+-- `guetteur livre resume`. Le plan JSON et le livre assemblé sont mis en cache
+-- pour permettre de relancer la sortie sans rejouer tous les appels Claude.
+CREATE TABLE IF NOT EXISTS livres (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel_url   TEXT NOT NULL,
+    channel_id    TEXT NOT NULL,
+    channel_name  TEXT NOT NULL DEFAULT '',
+    title         TEXT NOT NULL,
+    detail        TEXT NOT NULL DEFAULT 'standard',
+    filters_json  TEXT NOT NULL DEFAULT '{}',
+    status        TEXT NOT NULL DEFAULT 'pending',
+    plan_json     TEXT,
+    book_md       TEXT,
+    output_dir    TEXT,
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL,
+    started_at    TEXT,
+    finished_at   TEXT,
+    resume_after  TEXT,
+    last_error    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_livres_status ON livres(status, created_at);
+-- Vidéos d'un livre : rang stable dans la liste initiale, statut individuel de
+-- traitement (queued/summarized/failed/skipped). `livre_id + video_id` unique.
+CREATE TABLE IF NOT EXISTS livre_videos (
+    livre_id    INTEGER NOT NULL,
+    video_id    TEXT NOT NULL,
+    rank        INTEGER NOT NULL,
+    title       TEXT NOT NULL DEFAULT '',
+    duration_s  INTEGER,
+    published_at TEXT,
+    status      TEXT NOT NULL DEFAULT 'queued',
+    last_error  TEXT,
+    updated_at  TEXT NOT NULL,
+    PRIMARY KEY (livre_id, video_id)
+);
+CREATE INDEX IF NOT EXISTS idx_livre_videos_status
+    ON livre_videos(livre_id, status, rank);
 """
 )
 
@@ -160,6 +201,13 @@ _V1_COLUMNS = (
 
 def utcnow() -> datetime:
     return datetime.now(UTC)
+
+
+def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    """Convertit une `sqlite3.Row` en dict — l'itération sur `Row` renvoie ses
+    VALEURS (pas ses clefs), donc `{k: row[k] for k in row}` échoue avec
+    IndexError. `row.keys()` est la seule voie propre."""
+    return {k: row[k] for k in row.keys()}  # noqa: SIM118 — `.keys()` obligatoire ici
 
 
 def _iso(dt: datetime) -> str:
@@ -816,6 +864,138 @@ class Store:
             (Status.SENT.value, limit),
         ).fetchall()
         return [self._record(r) for r in rows]
+
+    # --- livres (Lot 7) --------------------------------------------------------------------
+
+    LIVRE_STATUSES = ("pending", "running", "paused", "done", "failed", "cancelled")
+
+    def create_livre(
+        self,
+        channel_url: str,
+        channel_id: str,
+        channel_name: str,
+        title: str,
+        detail: str,
+        filters_json: str,
+        videos: Sequence[tuple[str, str, int | None, str | None]],
+    ) -> int:
+        """Crée un livre et pré-remplit ses vidéos. `videos` : (video_id, title,
+        duration_s, published_at). Retourne l'id du livre."""
+        now = _now()
+        with self._tx() as conn:
+            cur = conn.execute(
+                "INSERT INTO livres (channel_url, channel_id, channel_name, title, detail, "
+                "filters_json, status, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+                (channel_url, channel_id, channel_name, title, detail, filters_json, now, now),
+            )
+            livre_id = int(cur.lastrowid or 0)
+            for rank, (video_id, vtitle, duration, published) in enumerate(videos):
+                conn.execute(
+                    "INSERT OR IGNORE INTO livre_videos (livre_id, video_id, rank, title, "
+                    "duration_s, published_at, status, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, 'queued', ?)",
+                    (livre_id, video_id, rank, vtitle, duration, published, now),
+                )
+        return livre_id
+
+    def get_livre(self, livre_id: int) -> dict[str, Any] | None:
+        row = self._conn.execute("SELECT * FROM livres WHERE id = ?", (livre_id,)).fetchone()
+        return _row_to_dict(row) if row else None
+
+    def list_livres(self, limit: int = 50) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT * FROM livres ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [_row_to_dict(r) for r in rows]
+
+    def has_running_livre(self, exclude_id: int | None = None) -> bool:
+        """Un livre est en cours si status ∈ (running, paused) : `paused` compte
+        aussi — on veut interdire d'en lancer un second pendant qu'un autre attend
+        sa reprise (usage_limit backoff)."""
+        sql = "SELECT 1 FROM livres WHERE status IN ('running', 'paused')"
+        params: list[Any] = []
+        if exclude_id is not None:
+            sql += " AND id != ?"
+            params.append(exclude_id)
+        return self._conn.execute(sql, params).fetchone() is not None
+
+    def set_livre_status(
+        self,
+        livre_id: int,
+        status: str,
+        *,
+        last_error: str | None = None,
+        resume_after: datetime | None = None,
+        started: bool = False,
+        finished: bool = False,
+    ) -> None:
+        if status not in self.LIVRE_STATUSES:
+            raise ValueError(f"statut de livre inconnu : {status!r}")
+        now = _now()
+        sets = ["status = ?", "updated_at = ?", "last_error = ?"]
+        params: list[Any] = [status, now, last_error]
+        if resume_after is not None:
+            sets.append("resume_after = ?")
+            params.append(_iso(resume_after))
+        else:
+            sets.append("resume_after = NULL")
+        if started:
+            sets.append("started_at = COALESCE(started_at, ?)")
+            params.append(now)
+        if finished:
+            sets.append("finished_at = ?")
+            params.append(now)
+        params.append(livre_id)
+        self._conn.execute(f"UPDATE livres SET {', '.join(sets)} WHERE id = ?", params)
+
+    def set_livre_plan(self, livre_id: int, plan_json: str) -> None:
+        self._conn.execute(
+            "UPDATE livres SET plan_json = ?, updated_at = ? WHERE id = ?",
+            (plan_json, _now(), livre_id),
+        )
+
+    def set_livre_output(self, livre_id: int, book_md: str, output_dir: str) -> None:
+        self._conn.execute(
+            "UPDATE livres SET book_md = ?, output_dir = ?, updated_at = ? WHERE id = ?",
+            (book_md, output_dir, _now(), livre_id),
+        )
+
+    def livre_videos(self, livre_id: int) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT * FROM livre_videos WHERE livre_id = ? ORDER BY rank",
+            (livre_id,),
+        ).fetchall()
+        return [_row_to_dict(r) for r in rows]
+
+    def livre_progress(self, livre_id: int) -> dict[str, int]:
+        """Retourne {statut: nb_de_vidéos} pour l'affichage /status."""
+        rows = self._conn.execute(
+            "SELECT status, COUNT(*) AS n FROM livre_videos WHERE livre_id = ? GROUP BY status",
+            (livre_id,),
+        ).fetchall()
+        return {str(r["status"]): int(r["n"]) for r in rows}
+
+    def next_queued_livre_video(self, livre_id: int) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT * FROM livre_videos WHERE livre_id = ? AND status = 'queued' "
+            "ORDER BY rank LIMIT 1",
+            (livre_id,),
+        ).fetchone()
+        return _row_to_dict(row) if row else None
+
+    def set_livre_video_status(
+        self,
+        livre_id: int,
+        video_id: str,
+        status: str,
+        last_error: str | None = None,
+    ) -> None:
+        self._conn.execute(
+            "UPDATE livre_videos SET status = ?, last_error = ?, updated_at = ? "
+            "WHERE livre_id = ? AND video_id = ?",
+            (status, last_error, _now(), livre_id, video_id),
+        )
 
     def _update(
         self,

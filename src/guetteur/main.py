@@ -773,6 +773,175 @@ def cmd_doctor(config: Config) -> int:
     return 0 if all(c.ok for c in checks) else 1
 
 
+def _parse_since_until(raw: str | None, name: str) -> Any:
+    """Parse `YYYY-MM-DD` en datetime UTC ; renvoie None si `raw` est vide."""
+    if not raw:
+        return None
+    from datetime import UTC as _UTC
+    from datetime import datetime as _dt
+
+    try:
+        return _dt.fromisoformat(raw).replace(tzinfo=_UTC)
+    except ValueError as exc:
+        raise ConfigError(f"--{name} : date invalide (YYYY-MM-DD attendu) : {raw!r}") from exc
+
+
+def cmd_livre_create(config: Config, args: argparse.Namespace) -> int:
+    """Étape 1 (résolution + estimation) + étape 2 (persistance) sous confirmation.
+    Sans --yes, affiche le plan et quitte (l'utilisateur relance avec --yes)."""
+    from guetteur.jobs.livre import (
+        JobAlreadyRunningError,
+        persist_new_livre,
+        plan_book,
+    )
+    from guetteur.sources.channel import ChannelFilters
+
+    filters = ChannelFilters(
+        min_duration_s=args.min_duration,
+        max_duration_s=args.max_duration,
+        since=_parse_since_until(args.since, "since"),
+        until=_parse_since_until(args.until, "until"),
+        include_shorts=args.include_shorts,
+        max_videos=args.max_videos or config.livre.max_videos_default,
+    )
+    try:
+        plan = plan_book(
+            config,
+            args.channel,
+            title=args.title,
+            filters=filters,
+            detail=args.detail,
+        )
+    except Exception as exc:
+        print(f"❌ {exc}", file=sys.stderr)
+        return 2
+    print(plan.render())
+    if not args.yes:
+        print(
+            "\nRelancez avec --yes pour créer le job "
+            "(puis `guetteur livre run <id>` pour démarrer)."
+        )
+        return 0
+    store = Store(config.db_path)
+    try:
+        try:
+            livre_id = persist_new_livre(store, plan, args.channel)
+        except JobAlreadyRunningError as exc:
+            print(f"❌ {exc}", file=sys.stderr)
+            return 2
+    finally:
+        store.close()
+    print(f"\n✅ Livre {livre_id} créé. `guetteur livre run {livre_id}` pour démarrer.")
+    return 0
+
+
+def cmd_livre_run(config: Config, livre_id: int) -> int:
+    """Résume les vidéos puis assemble et convertit le livre. Sur usage_limit,
+    le job est mis en `paused` avec `resume_after` — l'utilisateur relance
+    `guetteur livre resume <id>` puis `run <id>`."""
+    import subprocess as _sp
+    import threading
+
+    from guetteur.jobs.livre import (
+        BookAssembler,
+        LivreRunner,
+        finalize,
+        livre_status_text,
+    )
+    from guetteur.summarize import build_summarizer
+    from guetteur.transcript import Transcriber
+    from guetteur.transcript.whisper import WhisperTranscriber
+
+    store = Store(config.db_path)
+    try:
+        row = store.get_livre(livre_id)
+        if row is None:
+            print(f"❌ Livre {livre_id} inconnu", file=sys.stderr)
+            return 2
+        whisper = (
+            WhisperTranscriber(config.transcript.whisper_model)
+            if config.transcript.whisper_enabled
+            else None
+        )
+        transcriber = Transcriber(config.transcript.languages, whisper=whisper)
+        summarizer = build_summarizer(config)
+        claude_lock = threading.Lock()
+        runner = LivreRunner(
+            config=config,
+            store=store,
+            transcriber=transcriber,
+            summarizer=summarizer,
+            claude_lock=claude_lock,
+            progress=lambda msg: print(msg),
+        )
+        outcome = runner.run(livre_id)
+        if outcome != "summarized":
+            print(livre_status_text(store, livre_id))
+            return 0 if outcome == "done" else 1
+        # Assembler ne dépend PAS des méthodes internes du summarizer par défaut :
+        # en prod on branche un adaptateur `raw_call` sur le client Claude.
+        assembler = BookAssembler(config, store, summarizer, claude_lock=claude_lock)
+        try:
+            output = assembler.build(livre_id)
+        except Exception as exc:
+            store.set_livre_status(
+                livre_id, "failed", last_error=f"{type(exc).__name__}: {exc}"
+            )
+            print(f"❌ Assemblage : {exc}", file=sys.stderr)
+            return 2
+
+        def pandoc_call(cmd: list[str]) -> _sp.CompletedProcess[str]:
+            return _sp.run(cmd, capture_output=True, text=True, check=False)
+
+        final = finalize(output, title=str(row["title"]), pandoc_runner=pandoc_call)
+        store.set_livre_status(livre_id, "done", finished=True)
+        print(f"✅ Livre {livre_id} prêt : {final.livre_md}")
+        if final.epub:
+            print(f"   EPUB : {final.epub}")
+        if final.pdf:
+            print(f"   PDF  : {final.pdf}")
+    finally:
+        store.close()
+    return 0
+
+
+def cmd_livre_status(config: Config, livre_id: int) -> int:
+    from guetteur.jobs.livre import livre_status_text
+
+    store = Store(config.db_path)
+    try:
+        print(livre_status_text(store, livre_id))
+    finally:
+        store.close()
+    return 0
+
+
+def cmd_livre_list(config: Config) -> int:
+    from guetteur.jobs.livre import list_livres_text
+
+    store = Store(config.db_path)
+    try:
+        print(list_livres_text(store))
+    finally:
+        store.close()
+    return 0
+
+
+def cmd_livre_control(config: Config, verb: str, livre_id: int) -> int:
+    from guetteur.jobs.livre import cancel_livre, pause_livre, resume_livre
+
+    dispatch = {"pause": pause_livre, "resume": resume_livre, "cancel": cancel_livre}
+    if verb not in dispatch:
+        print(f"❌ verbe inconnu : {verb}", file=sys.stderr)
+        return 2
+    store = Store(config.db_path)
+    try:
+        print(dispatch[verb](store, livre_id))
+    finally:
+        store.close()
+    return 0
+
+
 def cmd_auth(config: Config, port: int, bind: str) -> int:
     from guetteur.sources.api import run_oauth_flow
 
@@ -863,6 +1032,29 @@ def build_parser() -> argparse.ArgumentParser:
     ap_target.add_argument("--pending", action="store_true")
     tn = sub.add_parser("test-notify", help="envoie un message de test")
     tn.add_argument("--channel", choices=["telegram", "whatsapp"], default=None)
+    lv = sub.add_parser("livre", help="Lot 7 : compile une chaîne YouTube en ebook")
+    lv_sub = lv.add_subparsers(dest="livre_verb", required=True)
+    lv_create = lv_sub.add_parser("create", help="crée un job livre à partir d'une URL de chaîne")
+    lv_create.add_argument("--channel", required=True, help="URL @handle, /channel/UC…, /c/…")
+    lv_create.add_argument("--title", default=None)
+    lv_create.add_argument(
+        "--detail", choices=list(DETAIL_LEVELS), default=None, help=detail_help
+    )
+    lv_create.add_argument("--min-duration", type=int, default=None, help="secondes minimum")
+    lv_create.add_argument("--max-duration", type=int, default=None, help="secondes maximum")
+    lv_create.add_argument("--since", default=None, help="YYYY-MM-DD (inclus)")
+    lv_create.add_argument("--until", default=None, help="YYYY-MM-DD (inclus)")
+    lv_create.add_argument("--max-videos", type=int, default=None)
+    lv_create.add_argument("--include-shorts", action="store_true")
+    lv_create.add_argument("--yes", action="store_true", help="créer sans confirmation")
+    lv_run = lv_sub.add_parser("run", help="lance ou reprend le job")
+    lv_run.add_argument("livre_id", type=int)
+    lv_status = lv_sub.add_parser("status", help="état d'un job")
+    lv_status.add_argument("livre_id", type=int)
+    lv_sub.add_parser("list", help="liste des livres en base")
+    for verb in ("pause", "resume", "cancel"):
+        p = lv_sub.add_parser(verb, help=f"{verb} un job")
+        p.add_argument("livre_id", type=int)
     sub.add_parser("doctor", help="vérifie claude, ffmpeg, la base et les jetons")
     au = sub.add_parser("auth", help="autorisation OAuth pour les playlists privées")
     au.add_argument("--port", type=int, default=8765)
@@ -908,6 +1100,20 @@ def cli(argv: Sequence[str] | None = None) -> int:
                 return cmd_test_notify(config, args.channel)
             case "doctor":
                 return cmd_doctor(config)
+            case "livre":
+                match args.livre_verb:
+                    case "create":
+                        return cmd_livre_create(config, args)
+                    case "run":
+                        return cmd_livre_run(config, args.livre_id)
+                    case "status":
+                        return cmd_livre_status(config, args.livre_id)
+                    case "list":
+                        return cmd_livre_list(config)
+                    case "pause" | "resume" | "cancel":
+                        return cmd_livre_control(config, args.livre_verb, args.livre_id)
+                    case _:
+                        return 2
             case "auth":
                 return cmd_auth(config, args.port, args.bind)
     except (ConfigError, SourceError) as exc:
