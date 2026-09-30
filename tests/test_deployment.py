@@ -406,6 +406,81 @@ def test_whisper_wanted_helper_shape() -> None:
         assert "whisper_enabled" in src
 
 
+def test_deploy_sh_runs_git_and_uv_under_service_user() -> None:
+    """Régression : deploy.sh lancé en root faisait « dubious ownership » sur
+    /opt/guetteur (possédé par guetteur). Toutes les commandes git ET uv doivent
+    donc passer par `sudo -u "$SERVICE_USER" -H` (via le helper `as_service`),
+    jamais tourner directement sous root."""
+    src = DEPLOY_SCRIPT.read_text(encoding="utf-8")
+    # Helper unique — source d'autorité pour git et uv.
+    assert re.search(
+        r'as_service\(\)\s*\{\s*\n\s*sudo -u "\$SERVICE_USER" -H env\s*\\',
+        src,
+    ), "helper as_service (sudo -u -H env) absent"
+    # gitc doit être défini via as_service (pas via `git -c safe.directory` en root).
+    assert re.search(r"gitc\(\)\s*\{\s*as_service git -C", src), (
+        "gitc doit s'appuyer sur as_service, pas sur `git` direct"
+    )
+    # `git -c safe.directory=…` est le contournement root-only qu'on cherche à
+    # éliminer : plus aucune invocation `git` ne doit le porter (on tolère la
+    # mention dans un commentaire d'explication).
+    code_lines = [ln for ln in src.splitlines() if not ln.lstrip().startswith("#")]
+    assert not any("safe.directory" in ln for ln in code_lines), (
+        "safe.directory ne doit plus apparaître dans le code : git tourne sous guetteur"
+    )
+    # uv sync doit aussi passer par as_service.
+    assert re.search(r"as_service bash -c '\s*\n\s*cd \"\$1\" && shift\s*\n\s*exec ", src), (
+        "uv sync doit s'exécuter dans un bash lancé via as_service"
+    )
+    # Le chown de rattrapage n'a plus de raison d'être : si git ne tourne jamais
+    # sous root, la propriété reste guetteur:guetteur d'elle-même.
+    assert "chown -R" not in src, (
+        "chown de rattrapage à supprimer : git sous guetteur n'inverse plus la propriété"
+    )
+
+
+def test_deploy_sh_marks_config_toml_skip_worktree() -> None:
+    """config.toml adapté localement dans le LXC fait échouer `git pull` (« would
+    be overwritten »). Le fix : marquer le fichier skip-worktree après le premier
+    pull, de façon idempotente — `ls-files -v` renvoie « S… » quand le drapeau
+    est déjà posé, on ne rappelle `update-index` que sinon."""
+    src = DEPLOY_SCRIPT.read_text(encoding="utf-8")
+    # L'appel effectif.
+    assert re.search(r"gitc update-index --skip-worktree config\.toml", src), (
+        "git update-index --skip-worktree config.toml absent"
+    )
+    # Idempotence : détection du drapeau via ls-files -v (première colonne = 'S').
+    assert re.search(r"gitc ls-files -v -- config\.toml", src), (
+        "détection du drapeau skip-worktree via `ls-files -v` absente"
+    )
+    assert re.search(r'\[\[\s*"\$flag"\s*!=\s*"S"\s*\]\]', src), (
+        "test d'idempotence sur le drapeau « S » attendu"
+    )
+
+
+def test_deploy_sh_shows_diff_config_example_at_end() -> None:
+    """config.toml skip-worktree = `git pull` ne fait plus remonter les
+    nouvelles clés. En fin de déploiement on affiche `diff -u
+    config.toml.lxc.example config.toml` pour que l'admin les recopie à la main
+    s'il en veut, avec un rappel explicite du statut skip-worktree."""
+    src = DEPLOY_SCRIPT.read_text(encoding="utf-8")
+    assert 'example="$INSTALL_DIR/config.toml.lxc.example"' in src
+    assert 'local_cfg="$INSTALL_DIR/config.toml"' in src
+    assert re.search(r'diff -u "\$example" "\$local_cfg"', src), (
+        "diff -u example vs local absent"
+    )
+    # Le rappel « skip-worktree » doit apparaître avec le diff — sinon l'admin
+    # verra un diff sans savoir pourquoi son fichier local n'a pas été mis à jour.
+    diff_block = re.search(
+        r'log "config\.toml\.lxc\.example.*?diff -u "\$example" "\$local_cfg"',
+        src,
+        re.DOTALL,
+    )
+    assert diff_block and "skip-worktree" in diff_block.group(0), (
+        "rappel explicite « skip-worktree » attendu près du diff final"
+    )
+
+
 # --- 6. shellcheck --------------------------------------------------------------------
 
 
