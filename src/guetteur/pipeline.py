@@ -514,16 +514,27 @@ class Pipeline:
 
     def _evaluate_applicability(self, video: Video, summary: Summary) -> list[Any]:
         from guetteur.export.obsidian import ObsidianExporter
-        from guetteur.summarize.applicability import build_evaluator_from_summarizer
+        from guetteur.summarize.applicability import (
+            build_evaluator_from_summarizer,
+            preselect_projects,
+        )
 
         exporter = ObsidianExporter(self._config, self._store)
         exporter.ensure_vault_layout()  # crée les fiches par défaut si absentes
         sheets = exporter.load_project_sheets()
         if not sheets:
             return []
+        # Présélection lexicale au-delà de max_projects (défaut 20) : le vault en
+        # prod contient 108 fiches, on n'envoie à Claude que les plus proches du
+        # résumé. La liste retenue est persistée pour /projets.
+        selected = preselect_projects(sheets, summary, self._config.applicability.max_projects)
+        self._store.set_meta(
+            "last_preselected_projects",
+            json.dumps([s.slug for s in selected], ensure_ascii=False),
+        )
         evaluator = build_evaluator_from_summarizer(self._summarizer)
         with self._claude_lock:
-            pertinences = evaluator.evaluate(video, summary, sheets)
+            pertinences = evaluator.evaluate(video, summary, selected)
         for p in pertinences:
             self._store.upsert_applicability(
                 video.video_id,

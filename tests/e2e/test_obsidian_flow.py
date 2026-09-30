@@ -124,6 +124,14 @@ def test_obsidian_flow_pipeline_then_keep_then_question_then_idea(tmp_path: Path
         stats = world.pipeline.run_cycle()
     assert stats.sent == 1
 
+    # La présélection lexicale a été persistée dans le meta store — /projets et
+    # `bot._cmd_projects` la relisent, elle survit à un redémarrage du bot.
+    raw = world.store.get_meta("last_preselected_projects")
+    assert raw is not None
+    persisted = json.loads(raw)
+    # Cinq fiches par défaut (< 20) : toutes passent, aucune coupe.
+    assert set(persisted) == {"coder", "eagle", "vigie", "console", "guetteur"}
+
     # === 2. La note est dans Veille/Inbox/ avec frontmatter guetteur: true.
     inbox = config.obsidian.path / "Veille" / "Inbox"
     notes = list(inbox.glob("*.md"))

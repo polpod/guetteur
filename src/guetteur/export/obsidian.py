@@ -31,6 +31,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 from guetteur.config import Config
 from guetteur.models import DetailLevel, Summary, Video
 from guetteur.store import Store
@@ -195,9 +197,13 @@ class ProjectSheet:
         return "\n".join(parts)
 
 
-def parse_project_sheet(slug: str, text: str) -> ProjectSheet:
-    """Parse une fiche projet Markdown avec frontmatter YAML minimal."""
-    front, body = _extract_frontmatter(text)
+def parse_project_sheet(slug: str, text: str, source: str | None = None) -> ProjectSheet:
+    """Parse une fiche projet Markdown avec frontmatter YAML.
+
+    `source` sert uniquement à nommer le fichier dans le warning affiché quand le
+    YAML est invalide et que l'on retombe sur le parseur maison — invisible pour
+    l'API en aval qui reçoit toujours un `ProjectSheet` déterministe."""
+    front, body = _extract_frontmatter(text, source=source)
     stack = _seq(front.get("stack"))
     return ProjectSheet(
         slug=slug,
@@ -219,20 +225,60 @@ def _seq(value: Any) -> tuple[str, ...]:
     if isinstance(value, str):
         return (value.strip(),) if value.strip() else ()
     if isinstance(value, list):
-        return tuple(str(v).strip() for v in value if str(v).strip())
+        # `- foo.py : rôle` est vu par YAML comme un flow mapping `{foo.py: rôle}`.
+        # On ré-aplatit en `foo.py : rôle` pour préserver la forme de l'ancien
+        # parseur maison (les fiches modules_cles en dépendent, cf. Lot 6 §3).
+        items: list[str] = []
+        for v in value:
+            if isinstance(v, dict) and len(v) == 1:
+                k, w = next(iter(v.items()))
+                items.append(f"{k} : {w}".strip())
+            else:
+                s = str(v).strip()
+                if s:
+                    items.append(s)
+        return tuple(items)
     return ()
 
 
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n?(.*)$", re.DOTALL)
 
 
-def _extract_frontmatter(text: str) -> tuple[dict[str, Any], str]:
-    """Parseur YAML minimal (clef: valeur, listes en puces). Suffisant pour les
-    fiches projet ; on ne dépend pas de PyYAML pour rester léger."""
+def _extract_frontmatter(text: str, source: str | None = None) -> tuple[dict[str, Any], str]:
+    """Parse le frontmatter YAML d'une fiche. `yaml.safe_load` d'abord (respecte
+    les listes inline avec virgules entre guillemets `[a, "b, c"]` que l'ancien
+    parseur maison coupait à chaque virgule) ; repli sur le parseur maison si le
+    YAML est invalide, avec un warning nommant le fichier. Le corps est renvoyé
+    inchangé — GUETTEUR ne le réécrit jamais."""
     match = _FRONTMATTER_RE.match(text)
     if not match:
         return {}, text
     front_raw, body = match.group(1), match.group(2)
+    try:
+        loaded = yaml.safe_load(front_raw)
+    except yaml.YAMLError as exc:
+        log.warning(
+            "obsidian.frontmatter_yaml_invalid",
+            extra={"file": source or "<inline>", "error": str(exc).splitlines()[0][:200]},
+        )
+        return _legacy_frontmatter(front_raw), body
+    if loaded is None:
+        return {}, body
+    if not isinstance(loaded, dict):
+        # Un frontmatter n'a de sens que comme mapping ; une liste ou un scalaire
+        # au niveau racine est traité comme vide (le corps reste intact).
+        log.warning(
+            "obsidian.frontmatter_not_a_mapping",
+            extra={"file": source or "<inline>", "type": type(loaded).__name__},
+        )
+        return {}, body
+    return {str(k): v for k, v in loaded.items()}, body
+
+
+def _legacy_frontmatter(front_raw: str) -> dict[str, Any]:
+    """Ancien parseur maison, conservé comme repli du bloc `_extract_frontmatter`
+    quand le YAML est invalide. Suffisant pour les cas simples (clef: valeur,
+    listes en puces, ou `[a, b]` sans virgule entre guillemets)."""
     data: dict[str, Any] = {}
     current_key: str | None = None
     for line in front_raw.splitlines():
@@ -259,7 +305,7 @@ def _extract_frontmatter(text: str) -> tuple[dict[str, Any], str]:
                 data[key] = [p.strip().strip('"').strip("'") for p in inner.split(",") if p.strip()]
             else:
                 data[key] = value.strip('"').strip("'")
-    return data, body
+    return data
 
 
 # --- frontmatter d'une note --------------------------------------------------------------
@@ -583,16 +629,48 @@ class ObsidianExporter:
     # --- projets ---------------------------------------------------------------------
 
     def load_project_sheets(self) -> list[ProjectSheet]:
+        """Charge les fiches `Projets/*.md` retenues pour la passe applicabilité.
+
+        Trois filtres, dans l'ordre :
+        - nom de fichier ne commence pas par « _ » (donc `_index.md`, `_notes.md`… sortent) ;
+        - frontmatter YAML porte `guetteur: true` (marqueur d'appartenance à GUETTEUR) ;
+        - `statut` figure dans `[applicability] statuts` (défaut « actif », « pause » —
+          une fiche « abandonne » ou « archive » n'est jamais envoyée au modèle).
+
+        Un log INFO résume le décompte chargées/ignorées pour tracer la présélection
+        depuis les journaux (utile quand le vault contient 100+ fiches)."""
         sheets: list[ProjectSheet] = []
         if not self._projets.exists():
             return sheets
+        allowed_statuts = {s.lower() for s in self._config.applicability.statuts}
+        rejected: dict[str, int] = {"prefix": 0, "no_marker": 0, "statut": 0, "read_error": 0}
         for md in sorted(self._projets.glob("*.md")):
+            if md.name.startswith("_"):
+                rejected["prefix"] += 1
+                continue
             try:
                 text = md.read_text(encoding="utf-8")
             except OSError:
+                rejected["read_error"] += 1
+                continue
+            front, _ = _extract_frontmatter(text, source=md.name)
+            if not front.get("guetteur"):
+                rejected["no_marker"] += 1
+                continue
+            statut = str(front.get("statut", "")).strip().lower()
+            if statut not in allowed_statuts:
+                rejected["statut"] += 1
                 continue
             slug = md.stem.lower()
-            sheets.append(parse_project_sheet(slug, text))
+            sheets.append(parse_project_sheet(slug, text, source=md.name))
+        log.info(
+            "obsidian.project_sheets_loaded",
+            extra={
+                "loaded": len(sheets),
+                "rejected": rejected,
+                "statuts_actifs": sorted(allowed_statuts),
+            },
+        )
         return sheets
 
     # --- note principale --------------------------------------------------------------
@@ -881,11 +959,16 @@ def _default_index_template() -> str:
 
 
 def _default_project_sheets() -> dict[str, str]:
-    """Fiches par défaut : coder, eagle, vigie, console, guetteur."""
+    """Fiches par défaut : coder, eagle, vigie, console, guetteur.
+
+    Toutes en `statut: actif` — sinon `load_project_sheets` les filtre puisque
+    `[applicability] statuts` n'accepte que « actif » et « pause » par défaut. La
+    ligne descriptive va dans `resume`, qui est libre (le frontmatter YAML est
+    tolérant) et ne bloque plus le chargement."""
     return {
         "coder": _sheet(
             "CODER",
-            "Agent multi-projets de développement local",
+            resume="Agent multi-projets de développement local",
             stack=["Python", "TypeScript", "Claude Code"],
             objectifs=[
                 "Automatiser les tâches répétitives de dev",
@@ -899,28 +982,28 @@ def _default_project_sheets() -> dict[str, str]:
         ),
         "eagle": _sheet(
             "EAGLE",
-            "Gestion de bibliothèque d'images / références visuelles",
+            resume="Gestion de bibliothèque d'images / références visuelles",
             stack=["Electron", "TypeScript"],
             objectifs=["Tagger vite, retrouver vite"],
             recherche=["Tagging auto par IA, embeddings d'images"],
         ),
         "vigie": _sheet(
             "VIGIE",
-            "Navigation surveillée (anti-doomscrolling)",
+            resume="Navigation surveillée (anti-doomscrolling)",
             stack=["Electron", "TypeScript"],
             objectifs=["Réduire le temps d'écran passif"],
             recherche=["Détection d'usage, limites douces, focus"],
         ),
         "console": _sheet(
             "CONSOLE",
-            "Terminal personnalisé cross-platform",
+            resume="Terminal personnalisé cross-platform",
             stack=["Electron", "xterm.js"],
             objectifs=["Terminal rapide et joli"],
             recherche=["Terminals, séquences ANSI, plugins de shell"],
         ),
         "guetteur": _sheet(
             "GUETTEUR",
-            "Veille YouTube résumée par Claude (ce projet)",
+            resume="Veille YouTube résumée par Claude (ce projet)",
             stack=["Python 3.12", "uv", "Claude Code", "SQLite"],
             objectifs=["Récupérer, résumer, envoyer, archiver, tagger"],
             recherche=["APIs Telegram, YouTube, NotebookLM, Anthropic ; scoring d'applicabilité"],
@@ -930,7 +1013,7 @@ def _default_project_sheets() -> dict[str, str]:
 
 def _sheet(
     nom: str,
-    statut: str,
+    resume: str = "",
     stack: list[str] | None = None,
     objectifs: list[str] | None = None,
     recherche: list[str] | None = None,
@@ -945,7 +1028,7 @@ def _sheet(
         "---",
         "guetteur: true",
         f"nom: {nom}",
-        f"statut: {statut}",
+        "statut: actif",
         _list_block("stack", stack),
         _list_block("objectifs", objectifs),
         _list_block("recherche", recherche),
@@ -954,7 +1037,9 @@ def _sheet(
         "",
         f"# {nom}",
         "",
+        f"{resume}\n" if resume else "",
         "Fiche projet éditée à la main. GUETTEUR lit `recherche` et `exclusions` pour",
-        "scorer chaque vidéo. Les modifications libres restent dans le corps.",
+        "scorer chaque vidéo. Passez `statut: pause` pour la garder mais l'exclure",
+        "temporairement de la présélection, `statut: abandonne` pour l'ignorer.",
     ]
     return "\n".join(lines) + "\n"

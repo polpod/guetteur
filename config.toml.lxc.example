@@ -63,6 +63,16 @@ enabled = true
 timeout_s = 120
 idea_threshold = 2
 mention_threshold = 1
+# Statuts de fiche projet retenus par load_project_sheets. Une fiche dont le
+# `statut` n'est PAS listé ici n'est jamais envoyée au modèle (typiquement
+# `abandonne`, `archive`, ou un statut ad-hoc que l'admin veut mettre de côté
+# sans supprimer la fiche).
+statuts = ["actif", "pause"]
+# Nombre maximum de fiches envoyées au modèle par passe. Au-delà, une
+# présélection lexicale ne garde que les `max_projects` fiches dont les sujets
+# recherchés collent le mieux au résumé. À monter si votre vault est petit et
+# que vous voulez que tout parte à chaque fois.
+max_projects = 20
 
 # Une section [[playlists]] par playlist surveillée.
 

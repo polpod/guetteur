@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -263,6 +264,167 @@ def build_evaluator_from_summarizer(summarizer: Any) -> ApplicabilityEvaluator:
     raise SummarizerUnavailableError(f"Backend applicabilité inconnu pour {cls_name!r}")
 
 
+# --- présélection lexicale (évite d'envoyer 100 fiches à Claude à chaque passe) ------
+
+
+# Suffixes fréquents en français : coupés en fin de token pour rapprocher les
+# formes (« agent », « agents », « agentique ») sans dépendre d'un vrai stemmer.
+# Ordre : les suffixes les plus longs d'abord (« ements » avant « ement »).
+_STEM_SUFFIXES = (
+    "ements",
+    "ations",
+    "ateurs",
+    "atrices",
+    "ations",
+    "ement",
+    "ations",
+    "ation",
+    "ateur",
+    "ations",
+    "ants",
+    "ance",
+    "ants",
+    "ent",
+    "ons",
+    "ait",
+    "es",
+    "s",
+)
+
+# Mots vides français + anglais courants dans les résumés et les fiches. La liste
+# reste courte : on ne veut pas fabriquer un vrai analyseur linguistique, juste
+# retirer les tokens qui ajoutent du bruit sur toutes les paires (« le », « the »).
+# Écrite comme chaînes concaténées puis split au chargement pour dédupliquer sans
+# entretenir un {...} à la main (ruff B033 se déclenche au moindre doublon).
+_STOPWORDS_RAW = (
+    # français
+    "le la les un une des du de d et ou ni "
+    "en au aux avec sans sur sous dans par pour "
+    "que qui quoi dont ce cet cette ces se sa "
+    "son ses leur leurs il elle on je tu nous "
+    "vous ils elles est a y n pas plus moins "
+    "mais donc car si aussi comme alors faire fait "
+    "peu tres tout tous toutes toute "
+    # anglais courants (chevauchement avec le français retiré : a, on)
+    "the an and or of to in for with "
+    "as by is are be at it this that we you"
+)
+_STOPWORDS = frozenset(_STOPWORDS_RAW.split())
+
+_TOKEN_RE = re.compile(r"[a-z0-9]+", re.IGNORECASE)
+
+
+def _stem(token: str) -> str:
+    """Stemmer minimal : lowercase + coupe des suffixes fréquents. Vise à mettre
+    « agent » et « agents » sur la même clé sans dépendre de nltk/snowball."""
+    t = token.lower()
+    for suf in _STEM_SUFFIXES:
+        if len(t) > len(suf) + 2 and t.endswith(suf):
+            return t[: -len(suf)]
+    return t
+
+
+def _tokenize(text: str) -> list[str]:
+    """Bag-of-words minimal : minuscules, `[a-z0-9]+`, stopwords retirés, stemmés."""
+    out: list[str] = []
+    for m in _TOKEN_RE.finditer(text or ""):
+        raw = m.group(0).lower()
+        if raw in _STOPWORDS or len(raw) < 2:
+            continue
+        stem = _stem(raw)
+        if stem in _STOPWORDS or len(stem) < 2:
+            continue
+        out.append(stem)
+    return out
+
+
+def _sheet_tokens(sheet: ProjectSheet) -> list[str]:
+    """Tokens caractéristiques d'une fiche : les sujets recherchés d'abord (poids
+    principal), puis la stack et le nom du projet. Les exclusions ne comptent pas
+    (elles décrivent ce que la fiche NE veut PAS voir remonter)."""
+    parts: list[str] = []
+    for r in sheet.recherche:
+        parts.extend(_tokenize(r))
+    for s in sheet.stack:
+        parts.extend(_tokenize(s))
+    for m in sheet.modules_cles:
+        parts.extend(_tokenize(m))
+    parts.extend(_tokenize(sheet.nom))
+    return parts
+
+
+def _summary_tokens(summary: Summary) -> list[str]:
+    """Tokens du résumé — titre, tldr, points-clés, sections/citations en mode détaillé."""
+    parts: list[str] = [*_tokenize(summary.title), *_tokenize(summary.tldr)]
+    for kp in summary.key_points:
+        parts.extend(_tokenize(kp.text))
+    parts.extend(_tokenize(summary.why_it_matters))
+    for sec in summary.sections:
+        parts.extend(_tokenize(sec.title))
+        for bullet in sec.bullets:
+            parts.extend(_tokenize(bullet))
+    for cit in summary.citations:
+        parts.extend(_tokenize(cit.text))
+    return parts
+
+
+def lexical_score(sheet: ProjectSheet, summary: Summary) -> float:
+    """Score de proximité fiche ↔ résumé.
+
+    - `recherche` pèse plus lourd (compte double) que `stack` et le `nom`.
+    - Le score final agrège fréquence côté résumé x poids côté fiche, normalisé
+      par la taille des tokens de la fiche pour éviter de privilégier les fiches
+      verbeuses face aux fiches courtes."""
+    summary_freq: dict[str, int] = {}
+    for tok in _summary_tokens(summary):
+        summary_freq[tok] = summary_freq.get(tok, 0) + 1
+    if not summary_freq:
+        return 0.0
+    weighted: dict[str, float] = {}
+    for r in sheet.recherche:
+        for tok in _tokenize(r):
+            weighted[tok] = weighted.get(tok, 0.0) + 2.0
+    for s in sheet.stack:
+        for tok in _tokenize(s):
+            weighted[tok] = weighted.get(tok, 0.0) + 1.0
+    for m in sheet.modules_cles:
+        for tok in _tokenize(m):
+            weighted[tok] = weighted.get(tok, 0.0) + 1.0
+    for tok in _tokenize(sheet.nom):
+        weighted[tok] = weighted.get(tok, 0.0) + 1.0
+    if not weighted:
+        return 0.0
+    total = 0.0
+    for tok, w in weighted.items():
+        total += w * summary_freq.get(tok, 0)
+    return float(total / max(1.0, sum(weighted.values()) ** 0.5))
+
+
+def preselect_projects(
+    sheets: list[ProjectSheet], summary: Summary, max_projects: int
+) -> list[ProjectSheet]:
+    """Renvoie au plus `max_projects` fiches, triées par score lexical décroissant.
+
+    Sous le seuil, on renvoie la liste telle quelle (aucun tri : l'ordre reçu du
+    vault est déjà stable, alphabétique). Log INFO systématique quand une
+    présélection a eu lieu — indispensable pour tracer côté production ce qui
+    est parti à Claude quand le vault en contient plusieurs dizaines."""
+    if len(sheets) <= max_projects:
+        return sheets
+    scored = [(sheet, lexical_score(sheet, summary)) for sheet in sheets]
+    scored.sort(key=lambda pair: (-pair[1], pair[0].slug))
+    kept = [sheet for sheet, _score in scored[:max_projects]]
+    log.info(
+        "applicability.preselected",
+        extra={
+            "total": len(sheets),
+            "kept": [s.slug for s in kept],
+            "max_projects": max_projects,
+        },
+    )
+    return kept
+
+
 # Le schéma de résumé est ré-exporté pour aider les tests qui vérifient qu'un même
 # backend supporte deux schémas différents (résumé + applicabilité).
 __all__ = [
@@ -273,6 +435,8 @@ __all__ = [
     "ClaudeCodeApplicabilityEvaluator",
     "Pertinence",
     "build_evaluator_from_summarizer",
+    "lexical_score",
     "parse_pertinences",
+    "preselect_projects",
     "schema_for",
 ]

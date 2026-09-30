@@ -14,7 +14,14 @@ from typing import Any
 
 import pytest
 
-from guetteur.config import Config, PlaylistConfig, Secrets, TelegramConfig
+from guetteur.config import (
+    ApplicabilityConfig,
+    Config,
+    ObsidianConfig,
+    PlaylistConfig,
+    Secrets,
+    TelegramConfig,
+)
 from guetteur.models import DetailLevel, KeyPoint, Summary
 from guetteur.notify.telegram_bot import (
     META_AWAITING_VIDEO,
@@ -593,3 +600,74 @@ def test_qa_history_is_reinjected_in_context(
     assert len(received[2]) == 2
     assert received[2][0][0] == "Q0"
     assert received[2][1][0] == "Q1"
+
+
+# --- /projets ---------------------------------------------------------------------
+
+
+def test_cmd_projects_shows_active_count_and_last_selection(tmp_path: Path) -> None:
+    """`/projets` doit lister les fiches actives (post-filtrage `_prefix + statut`)
+    et rappeler les slugs présélectionnés à la dernière passe applicabilité —
+    l\x27info est stockée dans le meta store par pipeline._evaluate_applicability."""
+    import json as _json
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "Projets").mkdir()
+    for slug, statut in (("alpha", "actif"), ("beta", "pause"), ("gamma", "abandonne")):
+        (vault / "Projets" / f"{slug}.md").write_text(
+            f"---\nguetteur: true\nnom: {slug.upper()}\nstatut: {statut}\n---\n",
+            encoding="utf-8",
+        )
+    # `_index.md` : ignoré par le préfixe.
+    (vault / "Projets" / "_index.md").write_text(
+        "---\nguetteur: true\nnom: Index\nstatut: actif\n---\n", encoding="utf-8"
+    )
+    config = _bot_config(
+        tmp_path,
+        obsidian=ObsidianConfig(enabled=True, path=vault, git_sync=False, git_remote=""),
+        applicability=ApplicabilityConfig(enabled=True),
+    )
+    store = Store(tmp_path / "guetteur.db")
+    try:
+        store.set_meta("last_preselected_projects", _json.dumps(["alpha", "beta"]))
+        api = FakeApi()
+        bot = _make_bot(config, store, api, FakeSummarizer())
+        bot.handle_update({"message": {"chat": {"id": 42}, "text": "/projets"}})
+    finally:
+        store.close()
+    assert len(api.messages_sent) == 1
+    text = api.messages_sent[0]["text"]
+    # Ligne 1 : décompte des fiches ACTIVES seulement (2 : alpha actif + beta pause).
+    assert text.startswith("2 fiche(s) projet active(s)")
+    # abandonne + _index sortent.
+    assert "gamma" not in text
+    assert "Index" not in text
+    # Bloc final : liste des slugs présélectionnés à la dernière passe.
+    assert "Dernière passe" in text
+    assert "alpha, beta" in text
+
+
+def test_cmd_projects_without_last_selection_omits_last_pass_line(tmp_path: Path) -> None:
+    """Sans meta \"last_preselected_projects\", la ligne de rappel est omise."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "Projets").mkdir()
+    (vault / "Projets" / "alpha.md").write_text(
+        "---\nguetteur: true\nnom: ALPHA\nstatut: actif\n---\n", encoding="utf-8"
+    )
+    config = _bot_config(
+        tmp_path,
+        obsidian=ObsidianConfig(enabled=True, path=vault, git_sync=False, git_remote=""),
+        applicability=ApplicabilityConfig(enabled=True),
+    )
+    store = Store(tmp_path / "guetteur.db")
+    try:
+        api = FakeApi()
+        bot = _make_bot(config, store, api, FakeSummarizer())
+        bot.handle_update({"message": {"chat": {"id": 42}, "text": "/projets"}})
+    finally:
+        store.close()
+    text = api.messages_sent[0]["text"]
+    assert text.startswith("1 fiche(s) projet active(s)")
+    assert "Dernière passe" not in text

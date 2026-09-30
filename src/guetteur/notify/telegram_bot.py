@@ -10,6 +10,7 @@ les mutations sur la base."""
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import threading
@@ -840,9 +841,23 @@ class TelegramBot:
         if not sheets:
             self._send_plain("Aucune fiche projet dans Projets/")
             return
-        lines = ["Fiches projet chargées :"]
+        # Ligne 1 : décompte des fiches actives (après filtrage `_` + statut).
+        lines = [f"{len(sheets)} fiche(s) projet active(s) :"]
         for s in sheets:
             lines.append(f"• {s.slug} — {s.nom} ({s.statut})")
+        # Ligne finale : slugs présélectionnés à la dernière passe (pipeline ou
+        # /applicabilite). Le stockage passe par le meta store, donc l'info
+        # survit à un redémarrage du bot.
+        raw = self._store.get_meta("last_preselected_projects")
+        if raw:
+            try:
+                last = json.loads(raw)
+            except json.JSONDecodeError:
+                last = []
+            if isinstance(last, list) and last:
+                lines.append("")
+                joined = ", ".join(str(s) for s in last)
+                lines.append(f"Dernière passe — présélection ({len(last)}) : {joined}")
         self._send_plain("\n".join(lines))
 
     def _cmd_applicability(self, args: list[str]) -> None:
@@ -870,7 +885,10 @@ class TelegramBot:
             )
             return
         from guetteur.export.obsidian import ObsidianExporter
-        from guetteur.summarize.applicability import build_evaluator_from_summarizer
+        from guetteur.summarize.applicability import (
+            build_evaluator_from_summarizer,
+            preselect_projects,
+        )
         from guetteur.summarize.base import summary_from_json
 
         exporter = ObsidianExporter(self._config, self._store)
@@ -881,10 +899,17 @@ class TelegramBot:
             return
         summary = summary_from_json(record.summary)
         video = record.to_video()
+        selected = preselect_projects(sheets, summary, self._config.applicability.max_projects)
+        # Persiste la sélection pour que /projets affiche la même liste que le
+        # pipeline automatique (source d'autorité : la dernière passe).
+        self._store.set_meta(
+            "last_preselected_projects",
+            json.dumps([s.slug for s in selected], ensure_ascii=False),
+        )
         evaluator = build_evaluator_from_summarizer(self._summarizer)
         try:
             with self._claude_lock:
-                pertinences = evaluator.evaluate(video, summary, sheets)
+                pertinences = evaluator.evaluate(video, summary, selected)
         except Exception as exc:
             log.exception("telegram_bot.applicability_failed", extra={"video_id": video_id})
             self._send_plain(f"Applicabilité en échec : {type(exc).__name__}")

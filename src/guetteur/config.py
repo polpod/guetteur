@@ -145,6 +145,15 @@ class ApplicabilityConfig:
     idea_threshold: int = 2
     # Score minimal pour la ligne « Pertinent pour » du message Telegram.
     mention_threshold: int = 1
+    # Statuts de fiche projet acceptés par `load_project_sheets`. Une fiche dont
+    # le `statut` est absent de cette liste (typiquement « abandonne », « archive »)
+    # n'est jamais envoyée au modèle et n'entre pas dans le compte des fiches actives.
+    statuts: tuple[str, ...] = ("actif", "pause")
+    # Nombre maximum de fiches envoyées au modèle par passe. Au-delà, une présélection
+    # lexicale (voir applicability.preselect_projects) ne garde que les `max_projects`
+    # fiches dont les sujets recherchés collent le mieux au résumé — permet de
+    # contenir le coût quand le vault contient des dizaines de fiches.
+    max_projects: int = 20
 
 
 @dataclass(frozen=True)
@@ -374,6 +383,18 @@ def _parse_applicability(raw: dict[str, Any]) -> ApplicabilityConfig:
         raise ConfigError(
             f"applicability.timeout_s doit être un nombre positif (reçu : {timeout!r})"
         )
+    statuts_raw = raw.get("statuts", list(default.statuts))
+    if not isinstance(statuts_raw, list) or not statuts_raw:
+        raise ConfigError(
+            f"applicability.statuts doit être une liste non vide (reçu : {statuts_raw!r})"
+        )
+    statuts: list[str] = []
+    for s in statuts_raw:
+        if not isinstance(s, str) or not s.strip():
+            raise ConfigError(
+                f"applicability.statuts doit être une liste de chaînes non vides (reçu : {s!r})"
+            )
+        statuts.append(s.strip())
     return ApplicabilityConfig(
         enabled=bool(raw.get("enabled", default.enabled)),
         timeout_s=float(timeout),
@@ -383,6 +404,10 @@ def _parse_applicability(raw: dict[str, Any]) -> ApplicabilityConfig:
         mention_threshold=_positive_int(
             raw.get("mention_threshold", default.mention_threshold),
             "applicability.mention_threshold",
+        ),
+        statuts=tuple(statuts),
+        max_projects=_positive_int(
+            raw.get("max_projects", default.max_projects), "applicability.max_projects"
         ),
     )
 

@@ -271,6 +271,101 @@ def test_append_idea_is_idempotent(tmp_path: Path) -> None:
 # --- parsing des fiches projet -------------------------------------------------------
 
 
+def test_load_project_sheets_skips_underscore_files_and_filters_statut(tmp_path: Path) -> None:
+    """Filtres : `_index.md` sort par le préfixe ; « abandonne » sort par le statut
+    (défaut `[applicability] statuts = ["actif", "pause"]`). Seules `actif` et
+    `pause` remontent au modèle."""
+    config = _config_with_vault(tmp_path)
+    projets = config.obsidian.path / "Projets"
+    projets.mkdir(parents=True, exist_ok=True)
+    (projets / "_index.md").write_text(
+        "---\nguetteur: true\nnom: Sommaire\nstatut: actif\n---\ncorps\n", encoding="utf-8"
+    )
+    (projets / "actif_a.md").write_text(
+        "---\nguetteur: true\nnom: A\nstatut: actif\n---\n", encoding="utf-8"
+    )
+    (projets / "pause_b.md").write_text(
+        "---\nguetteur: true\nnom: B\nstatut: pause\n---\n", encoding="utf-8"
+    )
+    (projets / "abandonne_c.md").write_text(
+        "---\nguetteur: true\nnom: C\nstatut: abandonne\n---\n", encoding="utf-8"
+    )
+    (projets / "sans_marker_d.md").write_text("---\nnom: D\nstatut: actif\n---\n", encoding="utf-8")
+    store = Store(tmp_path / "guetteur.db")
+    try:
+        exporter = ObsidianExporter(config, store)
+        slugs = {s.slug for s in exporter.load_project_sheets()}
+    finally:
+        store.close()
+    assert slugs == {"actif_a", "pause_b"}
+
+
+def test_load_project_sheets_honors_configured_statuts(tmp_path: Path) -> None:
+    """La liste `statuts` est configurable — un projet marqué `dev` n'est retenu
+    que si `dev` figure dans `[applicability] statuts` (config.toml)."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    obs = ObsidianConfig(enabled=True, path=vault, git_sync=False, git_remote="")
+    config = make_config(
+        tmp_path,
+        obsidian=obs,
+        applicability=ApplicabilityConfig(enabled=False, statuts=("dev", "prod")),
+    )
+    (vault / "Projets").mkdir()
+    (vault / "Projets" / "one.md").write_text(
+        "---\nguetteur: true\nnom: One\nstatut: dev\n---\n", encoding="utf-8"
+    )
+    (vault / "Projets" / "two.md").write_text(
+        "---\nguetteur: true\nnom: Two\nstatut: actif\n---\n", encoding="utf-8"
+    )
+    store = Store(tmp_path / "guetteur.db")
+    try:
+        slugs = {s.slug for s in ObsidianExporter(config, store).load_project_sheets()}
+    finally:
+        store.close()
+    # `actif` n'est plus dans la liste configurée : `two.md` sort.
+    assert slugs == {"one"}
+
+
+def test_frontmatter_preserves_quoted_commas_via_yaml() -> None:
+    """Régression de l'ancien parseur maison : `[a, "b, c", d]` était coupé sur
+    chaque virgule → `["a", "b", "c", "d"]`. Avec safe_load, la virgule protégée
+    par les guillemets reste dans son élément."""
+    text = (
+        "---\nnom: X\nstatut: actif\n"
+        'recherche: ["MCP", "hooks, sub-agents", "orchestration"]\n---\ncorps\n'
+    )
+    sheet = parse_project_sheet("x", text)
+    assert sheet.recherche == ("MCP", "hooks, sub-agents", "orchestration")
+
+
+def test_frontmatter_falls_back_to_legacy_on_invalid_yaml(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Si le YAML est invalide (indentation cassée, tabs mélangés à des espaces…),
+    on retombe sur le parseur maison plutôt que de tout perdre, et on logue un
+    warning nommant le fichier pour que l'admin puisse aller le corriger."""
+    text = (
+        "---\n"
+        "nom: X\n"
+        "statut: actif\n"
+        # ligne cassée volontairement : `foo: {` non fermé — YAMLError garanti.
+        "recherche: {non-terminé\n"
+        "---\n"
+    )
+    with caplog.at_level("WARNING"):
+        sheet = parse_project_sheet("x", text, source="broken.md")
+    # Le repli récupère au moins « nom » et « statut ».
+    assert sheet.nom == "X"
+    assert sheet.statut == "actif"
+    # Le warning cite le fichier pour permettre à l'admin de le corriger.
+    assert any(
+        rec.name == "guetteur.export.obsidian" and "frontmatter_yaml_invalid" in rec.message
+        for rec in caplog.records
+    ), [(r.name, r.message) for r in caplog.records]
+    assert any(getattr(rec, "file", None) == "broken.md" for rec in caplog.records)
+
+
 def test_parse_project_sheet_reads_frontmatter() -> None:
     text = (
         "---\nnom: CODER\nstatut: dev\nstack:\n  - Python\n"
