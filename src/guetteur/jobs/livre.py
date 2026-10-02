@@ -25,6 +25,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from typing import Protocol as _Protocol
 
 from guetteur.config import Config
 from guetteur.export.livre_output import (
@@ -41,20 +42,6 @@ from guetteur.sources.channel import (
     ChannelResolver,
     ChannelVideoLister,
 )
-# Types duck-typing pour les tests : n'importe quel objet avec `.resolve(url)`
-# ou `.list_videos(channel, filters)` fonctionne à la place des implémentations
-# httpx-backed. Le signal en prod reste `ChannelResolver` / `ChannelVideoLister`.
-from typing import Protocol as _Protocol
-
-
-class _Resolvable(_Protocol):
-    def resolve(self, url_or_handle: str) -> ChannelInfo: ...  # pragma: no cover
-
-
-class _Listable(_Protocol):
-    def list_videos(
-        self, channel: ChannelInfo, filters: ChannelFilters
-    ) -> list[tuple[Video, int | None]]: ...  # pragma: no cover
 from guetteur.store import Store
 from guetteur.summarize.base import (
     Summarizer,
@@ -73,6 +60,19 @@ from guetteur.summarize.book import (
     render_chapter,
 )
 from guetteur.transcript.base import NoTranscriptError, TranscriptProvider
+
+
+# Types duck-typing pour les tests : n'importe quel objet avec `.resolve(url)`
+# ou `.list_videos(channel, filters)` fonctionne à la place des implémentations
+# httpx-backed. Le signal en prod reste `ChannelResolver` / `ChannelVideoLister`.
+class _Resolvable(_Protocol):
+    def resolve(self, url_or_handle: str) -> ChannelInfo: ...  # pragma: no cover
+
+
+class _Listable(_Protocol):
+    def list_videos(
+        self, channel: ChannelInfo, filters: ChannelFilters
+    ) -> list[tuple[Video, int | None]]: ...  # pragma: no cover
 
 log = logging.getLogger(__name__)
 

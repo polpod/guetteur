@@ -136,9 +136,23 @@ class YouTubeApiSource:
                     params=params,
                     headers={"Authorization": f"Bearer {creds.token}"},
                 )
+            except httpx.HTTPError as exc:
+                # Jamais `{exc}` : certaines httpx.RequestError (TimeoutException,
+                # ProxyError, ConnectError via retries) rendent l'URL complète, qui
+                # porte un jeton d'accès dans l'en-tête — on garde seulement la
+                # classe. Le détail reste disponible via `exc.__cause__`.
+                raise SourceError(
+                    f"YouTube Data API : échec réseau pour {playlist_id} "
+                    f"({type(exc).__name__})"
+                ) from exc
+            try:
                 resp.raise_for_status()
             except httpx.HTTPError as exc:
-                raise SourceError(f"YouTube Data API : échec pour {playlist_id} : {exc}") from exc
+                reason = _extract_error_reason(resp) or resp.reason_phrase
+                raise SourceError(
+                    f"YouTube Data API : HTTP {resp.status_code} sur {playlist_id} "
+                    f"({reason or 'sans détail'})"
+                ) from exc
             data: dict[str, Any] = resp.json()
             items.extend(data.get("items", []))
             page_token = data.get("nextPageToken")
@@ -198,8 +212,13 @@ class YouTubeApiKeySource:
             try:
                 resp = self._client.get(PLAYLIST_ITEMS_URL, params=params)
             except httpx.HTTPError as exc:
+                # Jamais `{exc}` : la clé est portée en query-string et une
+                # httpx.HTTPStatusError formatte l'URL dans son message. On garde
+                # seulement la classe de l'exception, Google n'a renvoyé aucun
+                # payload exploitable à ce stade.
                 raise SourceError(
-                    f"YouTube Data API (clé) : échec réseau pour {playlist_id} : {exc}"
+                    f"YouTube Data API (clé) : échec réseau pour {playlist_id} "
+                    f"({type(exc).__name__})"
                 ) from exc
             # On enregistre l'appel dès qu'il est parti — même en cas de 403 quota,
             # Google l'a compté côté serveur.
@@ -213,12 +232,15 @@ class YouTubeApiKeySource:
                 raise PlaylistNotFoundError(
                     f"YouTube Data API : playlist introuvable ({playlist_id})"
                 )
-            try:
-                resp.raise_for_status()
-            except httpx.HTTPError as exc:
+            if resp.status_code >= 400:
+                # Pas de `resp.raise_for_status()` : son message HTTPStatusError
+                # porte l'URL complète (avec `?key=...`). On construit le texte
+                # à partir du statut et de la raison extraite du JSON Google.
+                reason = _extract_error_reason(resp) or resp.reason_phrase
                 raise SourceError(
-                    f"YouTube Data API (clé) : {resp.status_code} sur {playlist_id} : {exc}"
-                ) from exc
+                    f"YouTube Data API (clé) : HTTP {resp.status_code} sur "
+                    f"{playlist_id} ({reason or 'sans détail'})"
+                )
             data: dict[str, Any] = resp.json()
             items.extend(data.get("items", []))
             page_token = data.get("nextPageToken")

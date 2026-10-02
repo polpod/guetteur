@@ -24,6 +24,7 @@ from typing import Any, cast
 import httpx
 
 from guetteur.config import Config, PlaylistConfig
+from guetteur.logs import redact
 from guetteur.models import DETAIL_LEVELS, DetailLevel, Summary, Video
 from guetteur.notify.base import Message, NotifyError
 from guetteur.notify.telegram import TelegramNotifier
@@ -72,6 +73,16 @@ class TelegramApiError(RuntimeError):
     applique un backoff avant de retenter le prochain getUpdates."""
 
 
+def _redact_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Renvoie une copie du payload où les champs textuels passent par `redact`."""
+    redacted: dict[str, Any] = dict(payload)
+    for key in ("text", "caption"):
+        value = redacted.get(key)
+        if isinstance(value, str):
+            redacted[key] = redact(value)
+    return redacted
+
+
 class TelegramApi:
     """Client HTTP minimal pour les endpoints utilisés par le bot. Utilise le même
     httpx.Client que le notifier historique quand il est fourni (tests e2e mockent
@@ -82,6 +93,10 @@ class TelegramApi:
         self._client = client or httpx.Client(timeout=60.0)
 
     def _post(self, method: str, payload: dict[str, Any], timeout: float | None = None) -> Any:
+        # Dernière barrière : les champs textuels (`text`, `caption`) peuvent
+        # porter un secret si le bot relaie un log ou une erreur — on les
+        # redacte avant toute requête HTTP. Non destructif en nominal.
+        payload = _redact_payload(payload)
         try:
             resp = self._client.post(f"{self._base}/{method}", json=payload, timeout=timeout)
         except httpx.HTTPError as exc:
@@ -153,7 +168,7 @@ class TelegramApi:
                 files = {"document": (path.name, fh)}
                 data: dict[str, Any] = {"chat_id": chat_id}
                 if caption:
-                    data["caption"] = caption[:1024]
+                    data["caption"] = redact(caption[:1024])
                 resp = self._client.post(
                     f"{self._base}/sendDocument", data=data, files=files, timeout=180.0
                 )

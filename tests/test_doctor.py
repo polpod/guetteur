@@ -82,6 +82,31 @@ def test_claude_api_provider_checks_key(tmp_path: Path) -> None:
     assert not checks["ANTHROPIC_API_KEY"].ok
 
 
+def test_doctor_youtube_network_error_does_not_leak_key(tmp_path: Path) -> None:
+    """Si le ping YouTube Data API tombe en erreur réseau, le détail doit porter
+    la classe d'exception, jamais la clé — même si une sous-classe httpx
+    produisait un message incluant l'URL."""
+    import httpx
+
+    from guetteur.doctor import check_youtube_source
+
+    api_key = "AIzaSyA_fakekeyfakekeyfakekeyfakekey12"
+    config = make_config(tmp_path, source="api", secrets=Secrets(youtube_api_key=api_key))
+
+    def _raise(*_a: Any, **_kw: Any) -> httpx.Response:
+        raise httpx.ConnectError(
+            "boom https://www.googleapis.com/youtube/v3/playlistItems"
+            f"?key={api_key}&playlistId=PLx"
+        )
+
+    with patch("httpx.Client.get", side_effect=_raise):
+        checks = {c.name: c for c in check_youtube_source(config)}
+    detail = checks["youtube : clé API"].detail
+    assert "ConnectError" in detail
+    assert api_key not in detail
+    assert "key=" not in detail
+
+
 # --- doctor NotebookLM ------------------------------------------------------------------
 
 

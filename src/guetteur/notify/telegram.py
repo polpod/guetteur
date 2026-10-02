@@ -19,6 +19,7 @@ from typing import Any
 
 import httpx
 
+from guetteur.logs import redact
 from guetteur.notify.base import (
     Message,
     Notifier,
@@ -62,6 +63,13 @@ class TelegramNotifier(Notifier):
         self._client = client or httpx.Client(timeout=20.0)
 
     def _post(self, payload: dict[str, Any]) -> str | None:
+        # Dernière barrière : si un `text` sortant contient par accident un token
+        # (log repris dans une alerte, concaténation malheureuse…), on le masque
+        # AVANT que Telegram ne reçoive le message. Non destructif pour les
+        # messages réguliers : `redact` est un no-op quand rien ne matche.
+        text = payload.get("text")
+        if isinstance(text, str):
+            payload = {**payload, "text": redact(text)}
         try:
             resp = self._client.post(self._url, json=payload)
         except httpx.TimeoutException as exc:

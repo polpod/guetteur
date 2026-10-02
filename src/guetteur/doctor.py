@@ -213,7 +213,9 @@ def check_youtube_source(config: Config) -> list[Check]:
                 },
             )
     except httpx.HTTPError as exc:
-        checks.append(Check("youtube : clé API", False, f"réseau : {exc}"))
+        # On n'interpole pas `exc` : certaines sous-classes httpx (TimeoutException,
+        # ProxyError…) peuvent inclure l'URL — qui porte `?key=...`.
+        checks.append(Check("youtube : clé API", False, f"réseau : {type(exc).__name__}"))
         return checks
     if resp.status_code == 200:
         used = _read_quota_used(config)

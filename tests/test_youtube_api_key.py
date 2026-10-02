@@ -222,3 +222,42 @@ def test_url_contains_api_and_key_param() -> None:
     src.fetch("PLtest")
     assert captured[0].startswith(PLAYLIST_ITEMS_URL)
     assert "key=AIza-SECRET" in captured[0]
+
+
+def test_http_500_error_message_omits_url_and_key() -> None:
+    """Google renvoie une 5xx transitoire. Le message d'exception DOIT porter le
+    code et la raison mais JAMAIS l'URL (qui transporte la clé en query-string).
+    Verrou contre la régression de sécurité identifiée en revue (api.py:220)."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            500, json={"error": {"errors": [{"reason": "backendError"}]}}
+        )
+
+    api_key = "AIzaSyA_fakekeyfakekeyfakekeyfakekey12"
+    src = YouTubeApiKeySource(api_key, client=_mock_client(handler))
+    with pytest.raises(SourceError) as exc_info:
+        src.fetch("PLtest")
+    message = str(exc_info.value)
+    assert "500" in message
+    assert "backendError" in message
+    assert api_key not in message
+    assert "key=" not in message
+    assert "googleapis.com" not in message
+
+
+def test_network_error_message_omits_url_and_key() -> None:
+    """Pareil pour l'erreur réseau (TimeoutException, ConnectError) : on ne
+    renvoie que la classe de l'exception, jamais `str(exc)`."""
+    api_key = "AIzaSyA_fakekeyfakekeyfakekeyfakekey12"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("Nope: " + str(request.url))
+
+    src = YouTubeApiKeySource(api_key, client=_mock_client(handler))
+    with pytest.raises(SourceError) as exc_info:
+        src.fetch("PLtest")
+    message = str(exc_info.value)
+    assert "ConnectError" in message
+    assert api_key not in message
+    assert "key=" not in message
