@@ -803,6 +803,7 @@ def cmd_livre_create(config: Config, args: argparse.Namespace) -> int:
         until=_parse_since_until(args.until, "until"),
         include_shorts=args.include_shorts,
         max_videos=args.max_videos or config.livre.max_videos_default,
+        order=args.order,
     )
     try:
         plan = plan_book(
@@ -1045,6 +1046,17 @@ def build_parser() -> argparse.ArgumentParser:
     lv_create.add_argument("--since", default=None, help="YYYY-MM-DD (inclus)")
     lv_create.add_argument("--until", default=None, help="YYYY-MM-DD (inclus)")
     lv_create.add_argument("--max-videos", type=int, default=None)
+    lv_create.add_argument(
+        "--order",
+        choices=["date", "views", "duration"],
+        default="date",
+        help=(
+            "tri appliqué AVANT --max-videos : "
+            "date (défaut, plus récentes d'abord), views (plus vues d'abord), "
+            "duration (plus longues d'abord). "
+            "views et duration appellent videos.list (1 unité de quota par lot de 50)."
+        ),
+    )
     lv_create.add_argument("--include-shorts", action="store_true")
     lv_create.add_argument("--yes", action="store_true", help="créer sans confirmation")
     lv_run = lv_sub.add_parser("run", help="lance ou reprend le job")

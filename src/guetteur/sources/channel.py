@@ -13,7 +13,7 @@ import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 import httpx
 
@@ -53,6 +53,14 @@ class ChannelInfo:
     handle: str = ""
 
 
+# Clé de tri appliquée après filtrage et AVANT la coupe `max_videos`.
+# - `date` : plus récentes d'abord (ordre naturel pour une veille).
+# - `views` : plus vues d'abord (classement par popularité).
+# - `duration` : plus longues d'abord (sélection des formats longs).
+VideoOrder = Literal["date", "views", "duration"]
+VIDEO_ORDERS: tuple[VideoOrder, ...] = ("date", "views", "duration")
+
+
 @dataclass(frozen=True)
 class ChannelFilters:
     """Filtres appliqués côté client sur la liste des uploads."""
@@ -63,6 +71,7 @@ class ChannelFilters:
     until: datetime | None = None
     include_shorts: bool = False
     max_videos: int | None = None
+    order: VideoOrder = "date"
 
 
 def uploads_playlist_id(channel_id: str) -> str:
@@ -229,8 +238,9 @@ def parse_iso8601_duration(raw: str) -> int:
 
 class ChannelVideoLister:
     """Liste les uploads d'une chaîne avec pagination complète, puis enrichit
-    chaque vidéo avec `contentDetails.duration` (par lots de 50 ids : 1 unité par
-    lot). Filtres appliqués côté client à partir de `ChannelFilters`."""
+    chaque vidéo avec `contentDetails.duration` et `statistics.viewCount`
+    (par lots de 50 ids : 1 unité de quota par lot). Filtres et tri appliqués
+    côté client à partir de `ChannelFilters`."""
 
     def __init__(
         self,
@@ -251,21 +261,23 @@ class ChannelVideoLister:
 
     def list_videos(
         self, channel: ChannelInfo, filters: ChannelFilters
-    ) -> list[tuple[Video, int | None]]:
-        """Retourne des (Video, duration_s) triés du plus ancien au plus récent —
-        ordre de lecture naturel pour la compilation en livre. `duration_s` peut
-        être None si la vidéo n'a pas de durée (live en cours)."""
+    ) -> list[tuple[Video, int | None, int | None]]:
+        """Retourne des (Video, duration_s, view_count) ordonnés selon
+        `filters.order` (desc) : plus récentes / plus vues / plus longues
+        d'abord. `max_videos` est appliqué APRÈS le tri, pour garder le top-N
+        selon l'intention de l'utilisateur. `duration_s` et `view_count`
+        peuvent être None (live en cours, compteur de vues désactivé)."""
         raw_videos = self._source.fetch(channel.uploads_playlist_id)
-        durations = self._durations([v.video_id for v in raw_videos])
-        keep: list[tuple[Video, int | None]] = []
+        stats = self._statistics([v.video_id for v in raw_videos])
+        keep: list[tuple[Video, int | None, int | None]] = []
         for v in raw_videos:
-            duration = durations.get(v.video_id)
+            duration, views = stats.get(v.video_id, (None, None))
             if not _passes_filters(v, duration, filters):
                 continue
-            keep.append((v, duration))
-        # Tri chronologique (ancien → récent) : le lecteur du livre attend
-        # l'ordre naturel de publication ; l'API renvoie récent → ancien.
-        keep.sort(key=lambda pair: pair[0].published.timestamp() if pair[0].published else 0.0)
+            keep.append((v, duration, views))
+        # Tri par la clé choisie puis coupe à max_videos. L'ordre de tri est
+        # desc pour les trois clés : récent / le plus vu / le plus long d'abord.
+        keep.sort(key=_sort_key(filters.order), reverse=True)
         if filters.max_videos is not None:
             keep = keep[: filters.max_videos]
         log.info(
@@ -274,16 +286,22 @@ class ChannelVideoLister:
                 "channel_id": channel.channel_id,
                 "raw": len(raw_videos),
                 "kept": len(keep),
+                "order": filters.order,
             },
         )
         return keep
 
-    def _durations(self, video_ids: list[str]) -> dict[str, int | None]:
-        out: dict[str, int | None] = {}
+    def _statistics(
+        self, video_ids: list[str]
+    ) -> dict[str, tuple[int | None, int | None]]:
+        """Renvoie `{video_id: (duration_s, view_count)}` en interrogeant
+        `videos.list?part=contentDetails,statistics` par lots de 50 ids (1
+        unité de quota par lot — même coût que fetcher la seule durée)."""
+        out: dict[str, tuple[int | None, int | None]] = {}
         for chunk_start in range(0, len(video_ids), 50):
             chunk = video_ids[chunk_start : chunk_start + 50]
             params: dict[str, Any] = {
-                "part": "contentDetails",
+                "part": "contentDetails,statistics",
                 "id": ",".join(chunk),
                 "maxResults": 50,
                 "key": self._api_key,
@@ -291,20 +309,54 @@ class ChannelVideoLister:
             try:
                 resp = self._client.get(VIDEOS_URL, params=params)
             except httpx.HTTPError as exc:  # pragma: no cover
-                raise SourceError(f"videos.list : {exc}") from exc
+                raise SourceError(f"videos.list : {type(exc).__name__}") from exc
             self._on_call()
             if resp.status_code != 200:
                 raise SourceError(
                     f"videos.list HTTP {resp.status_code} : {resp.text[:200]}"
                 )
-            data = resp.json() if isinstance(resp.json(), dict) else {}
+            payload = resp.json()
+            data: dict[str, Any] = payload if isinstance(payload, dict) else {}
             for item in data.get("items", []):
                 vid = str(item.get("id", ""))
-                details = item.get("contentDetails", {})
-                dur_raw = str(details.get("duration", ""))
-                seconds = parse_iso8601_duration(dur_raw)
-                out[vid] = seconds or None
+                if not vid:
+                    continue
+                details = item.get("contentDetails", {}) or {}
+                statistics = item.get("statistics", {}) or {}
+                duration = parse_iso8601_duration(str(details.get("duration", ""))) or None
+                views_raw = statistics.get("viewCount")
+                views: int | None
+                try:
+                    views = int(views_raw) if views_raw is not None else None
+                except (TypeError, ValueError):
+                    views = None
+                out[vid] = (duration, views)
         return out
+
+
+def _sort_key(
+    order: VideoOrder,
+) -> Any:
+    """Clé de tri `(primaire, tie-breaker)` pour l'ordre choisi. `None` est
+    renvoyé en dernier via un sentinel négatif en premier élément : trié
+    descendant, les valeurs présentes passent devant les absences."""
+    if order == "views":
+        return lambda entry: (
+            entry[2] is not None,
+            entry[2] or 0,
+            entry[0].published.timestamp() if entry[0].published else 0.0,
+        )
+    if order == "duration":
+        return lambda entry: (
+            entry[1] is not None,
+            entry[1] or 0,
+            entry[0].published.timestamp() if entry[0].published else 0.0,
+        )
+    # order == "date"
+    return lambda entry: (
+        entry[0].published is not None,
+        entry[0].published.timestamp() if entry[0].published else 0.0,
+    )
 
 
 def _passes_filters(
@@ -351,7 +403,7 @@ def list_channel_videos(
     filters: ChannelFilters,
     client: httpx.Client | None = None,
     on_call: Any = None,
-) -> list[tuple[Video, int | None]]:
+) -> list[tuple[Video, int | None, int | None]]:
     return ChannelVideoLister(api_key, client=client, on_call=on_call).list_videos(
         channel, filters
     )
@@ -360,10 +412,12 @@ def list_channel_videos(
 # Ré-exporte parse_datetime pour les tests
 __all__ = [
     "SHORTS_MAX_DURATION_S",
+    "VIDEO_ORDERS",
     "ChannelFilters",
     "ChannelInfo",
     "ChannelResolver",
     "ChannelVideoLister",
+    "VideoOrder",
     "_parse_datetime",
     "list_channel_videos",
     "parse_iso8601_duration",

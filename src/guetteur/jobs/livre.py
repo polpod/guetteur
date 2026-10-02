@@ -72,7 +72,7 @@ class _Resolvable(_Protocol):
 class _Listable(_Protocol):
     def list_videos(
         self, channel: ChannelInfo, filters: ChannelFilters
-    ) -> list[tuple[Video, int | None]]: ...  # pragma: no cover
+    ) -> list[tuple[Video, int | None, int | None]]: ...  # pragma: no cover
 
 log = logging.getLogger(__name__)
 
@@ -85,7 +85,7 @@ class LivrePlan:
     """Résumé du travail à faire, affiché avant `--yes` de confirmation."""
 
     channel: ChannelInfo
-    videos: list[tuple[Video, int | None]]
+    videos: list[tuple[Video, int | None, int | None]]
     title: str
     detail: DetailLevel
     filters: ChannelFilters
@@ -93,7 +93,7 @@ class LivrePlan:
 
     @property
     def total_duration_s(self) -> int:
-        return sum(d for _v, d in self.videos if d)
+        return sum(d for _v, d, _vc in self.videos if d)
 
     def render(self) -> str:
         n = len(self.videos)
@@ -102,13 +102,47 @@ class LivrePlan:
         lines = [
             f"Livre : {self.title}",
             f"Chaîne : {self.channel.title or self.channel.channel_id} ({self.channel.channel_id})",
-            f"Vidéos : {n}",
+            f"Vidéos : {n} (triées par {self.filters.order})",
             f"Durée totale : {hours} h {minutes:02d} min",
             f"Niveau de résumé : {self.detail}",
             f"Estimation Claude : ~{self.estimated_minutes:.0f} min "
             f"(≈ {self.estimated_minutes / 60:.1f} h)",
+            "",
+            "Vidéos retenues (titre · vues · durée) :",
         ]
+        for v, duration, views in self.videos:
+            lines.append(
+                f"  - {_truncate(v.title, 70)} · {_fmt_views(views)} · {_fmt_duration(duration)}"
+            )
         return "\n".join(lines)
+
+
+def _truncate(text: str, limit: int) -> str:
+    text = (text or "").strip()
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def _fmt_views(views: int | None) -> str:
+    """Format court pour affichage : 1 234 → '1.2k', 1 234 567 → '1.2M'."""
+    if views is None:
+        return "— vues"
+    if views < 1_000:
+        return f"{views} vues"
+    if views < 1_000_000:
+        return f"{views / 1_000:.1f}k vues"
+    if views < 1_000_000_000:
+        return f"{views / 1_000_000:.1f}M vues"
+    return f"{views / 1_000_000_000:.1f}G vues"
+
+
+def _fmt_duration(seconds: int | None) -> str:
+    if not seconds:
+        return "—"
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}"
+    return f"{minutes}m{secs:02d}"
 
 
 class JobAlreadyRunningError(RuntimeError):
@@ -172,7 +206,7 @@ def persist_new_livre(store: Store, plan: LivrePlan, channel_url: str) -> int:
                 d,
                 v.published.isoformat() if v.published else None,
             )
-            for v, d in plan.videos
+            for v, d, _vc in plan.videos
         ],
     )
 
@@ -185,6 +219,7 @@ def _filters_to_dict(filters: ChannelFilters) -> dict[str, Any]:
         "until": filters.until.isoformat() if filters.until else None,
         "include_shorts": filters.include_shorts,
         "max_videos": filters.max_videos,
+        "order": filters.order,
     }
 
 

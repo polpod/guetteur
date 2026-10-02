@@ -19,7 +19,10 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
+
+if TYPE_CHECKING:
+    from guetteur.sources.channel import VideoOrder
 
 import httpx
 
@@ -81,6 +84,56 @@ def _redact_payload(payload: dict[str, Any]) -> dict[str, Any]:
         if isinstance(value, str):
             redacted[key] = redact(value)
     return redacted
+
+
+def _parse_livre_cmd_args(args: list[str]) -> tuple[str, VideoOrder, int | None]:
+    """Parseur minimal pour `/livre <URL> [--order X] [--max N]`.
+
+    Volontairement artisanal (pas d'argparse) : la commande reste
+    permissive à l'ordre des flags, lève des `ValueError` lisibles, et
+    évite d'exécuter du code depuis le payload Telegram (seules les
+    valeurs des choix fermés sont acceptées). Retourne `(url, order, max_videos)`."""
+    from guetteur.sources.channel import VIDEO_ORDERS
+
+    order: VideoOrder = "date"
+    max_videos: int | None = None
+    url: str | None = None
+    i = 0
+    while i < len(args):
+        tok = args[i]
+        if tok == "--order":
+            if i + 1 >= len(args):
+                raise ValueError("--order attend une valeur (date|views|duration)")
+            value = args[i + 1]
+            if value not in VIDEO_ORDERS:
+                raise ValueError(
+                    f"--order inconnu : {value!r} (attendu date|views|duration)"
+                )
+            # mypy narrowe `str` → VideoOrder via l'`in VIDEO_ORDERS` (tuple de Literal).
+            order = value
+            i += 2
+        elif tok == "--max":
+            if i + 1 >= len(args):
+                raise ValueError("--max attend un entier positif")
+            try:
+                max_videos = int(args[i + 1])
+            except ValueError as exc:
+                raise ValueError(
+                    f"--max : entier attendu, reçu {args[i + 1]!r}"
+                ) from exc
+            if max_videos <= 0:
+                raise ValueError("--max doit être strictement positif")
+            i += 2
+        elif tok.startswith("--"):
+            raise ValueError(f"option inconnue : {tok}")
+        else:
+            if url is not None:
+                raise ValueError("une seule URL de chaîne attendue")
+            url = tok
+            i += 1
+    if url is None:
+        raise ValueError("URL de chaîne manquante")
+    return url, order, max_videos
 
 
 class TelegramApi:
@@ -799,27 +852,36 @@ class TelegramBot:
         self._send_plain(f"Commande inconnue : {cmd}. /help pour la liste.")
 
     def _cmd_livre_create(self, args: list[str]) -> None:
-        """`/livre <URL>` : crée un job livre à partir d'une URL de chaîne, avec
-        les valeurs par défaut de config (`[livre] max_videos_default`,
-        `detail_default`). Aucun filtre avancé côté bot — pour --min-duration,
-        --since, etc. l'utilisateur passe par la CLI. Le job n'est PAS lancé
-        automatiquement : le bot renvoie l'estimation et attend la confirmation
-        via `/livre run <id>` (délégué à la CLI dans un terminal)."""
+        """`/livre <URL> [--order date|views|duration] [--max N]` : crée un job
+        livre à partir d'une URL de chaîne, avec les valeurs par défaut de
+        config (`[livre] max_videos_default`, `detail_default`). Les flags
+        `--order` et `--max` reflètent `livre create --order/--max-videos` de
+        la CLI. Pour les autres filtres (--since, --min-duration…) l'utilisateur
+        passe toujours par un terminal. Le job n'est PAS lancé automatiquement :
+        le bot renvoie l'estimation et attend la confirmation via
+        `guetteur livre run <id>` (délégué à un terminal)."""
         if not args:
             self._send_plain(
-                "Usage : /livre <URL de chaîne>\n"
+                "Usage : /livre <URL de chaîne> [--order date|views|duration] [--max N]\n"
                 "Ensuite : `guetteur livre run <id>` depuis un terminal pour lancer."
             )
+            return
+        try:
+            url, order, max_videos = _parse_livre_cmd_args(args)
+        except ValueError as exc:
+            self._send_plain(f"/livre : {exc}")
             return
         if self._store.has_running_livre():
             self._send_plain("Un livre est déjà en cours. `/livres` pour voir l'état.")
             return
-        url = args[0]
         try:
             from guetteur.jobs.livre import persist_new_livre, plan_book
             from guetteur.sources.channel import ChannelFilters
 
-            filters = ChannelFilters(max_videos=self._config.livre.max_videos_default)
+            filters = ChannelFilters(
+                max_videos=max_videos or self._config.livre.max_videos_default,
+                order=order,
+            )
             plan = plan_book(self._config, url, title=None, filters=filters)
             livre_id = persist_new_livre(self._store, plan, url)
         except Exception as exc:
@@ -1044,7 +1106,8 @@ class TelegramBot:
             "/projets — liste les fiches projet chargées\n"
             "/applicabilite <id> — relance la seconde passe Claude\n"
             "/idees <projet> — 5 dernières entrées de Projets/<projet>/IDEES.md\n"
-            "/livre <URL> — crée un job de compilation d'une chaîne YouTube en ebook\n"
+            "/livre <URL> [--order date|views|duration] [--max N] — crée un job de "
+            "compilation d'une chaîne YouTube en ebook\n"
             "/livres — liste les livres en base et leur état\n"
             "/help — cette aide\n\n"
             "Réponds à n'importe quel message de résumé pour poser une question sur la vidéo, "

@@ -47,9 +47,9 @@ class FakeChannelLister:
 
     def list_videos(
         self, channel: ChannelInfo, filters: ChannelFilters
-    ) -> list[tuple[Video, int | None]]:
+    ) -> list[tuple[Video, int | None, int | None]]:
         base = datetime(2026, 1, 1, tzinfo=UTC)
-        vids: list[tuple[Video, int | None]] = []
+        vids: list[tuple[Video, int | None, int | None]] = []
         for i in range(self._n):
             vid = f"vid{i:08d}xy"[:11]
             v = Video(
@@ -59,7 +59,7 @@ class FakeChannelLister:
                 published=base + timedelta(days=i),
                 url=f"https://youtu.be/{vid}",
             )
-            vids.append((v, 1200))
+            vids.append((v, 1200, 10_000 + i * 100))
         return vids
 
 
@@ -160,7 +160,7 @@ def test_livre_flow_full_pipeline_to_epub(tmp_path: Path) -> None:
         livre_id = persist_new_livre(store, plan, "https://youtube.com/@chaine_test")
         assert livre_id > 0
         # 3. Résumés de toutes les vidéos.
-        vids = [v.video_id for v, _d in plan.videos]
+        vids = [v.video_id for v, _d, _vc in plan.videos]
         summarizer = RawCallSummarizer(
             plan_json=_fake_plan_json(vids), chapter_md=_fake_chapter_md()
         )
