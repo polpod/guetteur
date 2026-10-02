@@ -837,9 +837,12 @@ def cmd_livre_create(config: Config, args: argparse.Namespace) -> int:
 
 
 def cmd_livre_run(config: Config, livre_id: int) -> int:
-    """Résume les vidéos puis assemble et convertit le livre. Sur usage_limit,
-    le job est mis en `paused` avec `resume_after` — l'utilisateur relance
-    `guetteur livre resume <id>` puis `run <id>`."""
+    """Résume les vidéos puis assemble et convertit le livre. Reprend à l'étape
+    assemblage quand les résumés sont déjà complets (`phase` = planning / writing /
+    rendering) et reprend au chapitre suivant quand un chapitre a échoué (voir
+    `livre_chapters`). Sur usage_limit, le job est mis en `paused` avec
+    `resume_after` — l'utilisateur relance `guetteur livre resume <id>` puis
+    `run <id>`."""
     import subprocess as _sp
     import threading
 
@@ -859,35 +862,59 @@ def cmd_livre_run(config: Config, livre_id: int) -> int:
         if row is None:
             print(f"❌ Livre {livre_id} inconnu", file=sys.stderr)
             return 2
-        whisper = (
-            WhisperTranscriber(config.transcript.whisper_model)
-            if config.transcript.whisper_enabled
-            else None
-        )
-        transcriber = Transcriber(config.transcript.languages, whisper=whisper)
+        if row["status"] == "done":
+            print(livre_status_text(store, livre_id))
+            return 0
+        if row["status"] == "cancelled":
+            print(f"❌ Livre {livre_id} annulé — rien à relancer.", file=sys.stderr)
+            return 1
+        if row["status"] == "paused":
+            print(
+                f"⏸ Livre {livre_id} suspendu. `guetteur livre resume {livre_id}` d'abord.",
+                file=sys.stderr,
+            )
+            return 1
         summarizer = build_summarizer(config)
         claude_lock = threading.Lock()
-        runner = LivreRunner(
-            config=config,
-            store=store,
-            transcriber=transcriber,
-            summarizer=summarizer,
+        # Reprise : on ne retente la boucle de résumés QUE s'il reste au moins
+        # une vidéo en file. Sinon, on saute directement à l'assemblage (plan +
+        # chapitres), ce qui préserve le travail déjà fait après un crash côté
+        # assemblage.
+        if store.next_queued_livre_video(livre_id) is not None:
+            whisper = (
+                WhisperTranscriber(config.transcript.whisper_model)
+                if config.transcript.whisper_enabled
+                else None
+            )
+            transcriber = Transcriber(config.transcript.languages, whisper=whisper)
+            runner = LivreRunner(
+                config=config,
+                store=store,
+                transcriber=transcriber,
+                summarizer=summarizer,
+                claude_lock=claude_lock,
+                progress=lambda msg: print(msg),
+            )
+            outcome = runner.run(livre_id)
+            if outcome != "summarized":
+                print(livre_status_text(store, livre_id))
+                return 0 if outcome == "done" else 1
+        # Assembleur : utilise `summarizer.raw_call` sur le backend courant
+        # (claude_code ou claude_api). Reprise par chapitre via `livre_chapters`.
+        assembler = BookAssembler(
+            config,
+            store,
+            summarizer,
             claude_lock=claude_lock,
             progress=lambda msg: print(msg),
         )
-        outcome = runner.run(livre_id)
-        if outcome != "summarized":
-            print(livre_status_text(store, livre_id))
-            return 0 if outcome == "done" else 1
-        # Assembler ne dépend PAS des méthodes internes du summarizer par défaut :
-        # en prod on branche un adaptateur `raw_call` sur le client Claude.
-        assembler = BookAssembler(config, store, summarizer, claude_lock=claude_lock)
         try:
             output = assembler.build(livre_id)
         except Exception as exc:
             store.set_livre_status(
                 livre_id, "failed", last_error=f"{type(exc).__name__}: {exc}"
             )
+            store.set_livre_phase(livre_id, "failed")
             print(f"❌ Assemblage : {exc}", file=sys.stderr)
             return 2
 

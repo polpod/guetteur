@@ -60,3 +60,52 @@ class ClaudeApiSummarizer(ChunkedSummarizer):
         except json.JSONDecodeError as exc:
             raise SummarizeError(f"JSON invalide renvoyé par Claude : {exc}") from exc
         return data
+
+    # --- raw_call (Lot 7 : passes livre) ------------------------------------
+
+    def raw_call(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        json_schema: dict[str, Any] | None,
+        timeout_s: float,
+    ) -> str:
+        """Appel brut via le SDK. Si `json_schema` est fourni, la sortie est
+        contrainte par le schéma (`output_config.format = json_schema`) ; sinon
+        on prend le premier bloc texte renvoyé. `timeout_s` est propagé au SDK
+        via l'option `timeout` — un chapitre de 1500 à 4000 mots dépasse les
+        180 s par défaut, le Lot 7 passe 900 s."""
+        kwargs: dict[str, Any] = {
+            "model": self._model,
+            "max_tokens": MAX_TOKENS_DETAILED,
+            "system": system_prompt,
+            "messages": [{"role": "user", "content": user_prompt}],
+            "timeout": timeout_s,
+        }
+        if json_schema is not None:
+            kwargs["output_config"] = {
+                "format": {"type": "json_schema", "schema": json_schema},
+            }
+        try:
+            response = self._client.messages.create(**kwargs)
+        except (anthropic.AuthenticationError, anthropic.PermissionDeniedError) as exc:
+            raise SummarizerUnavailableError(
+                f"API Claude : clé refusée (HTTP {exc.status_code}) — vérifiez ANTHROPIC_API_KEY"
+            ) from exc
+        except anthropic.APIStatusError as exc:
+            raise SummarizeError(
+                f"API Claude : HTTP {exc.status_code} : {exc.message}"
+            ) from exc
+        except anthropic.APIConnectionError as exc:
+            # Le message brut peut contenir l'URL : on garde la classe uniquement.
+            raise SummarizeError(
+                f"API Claude injoignable ({type(exc).__name__})"
+            ) from exc
+        if response.stop_reason in ("max_tokens", "refusal"):
+            raise SummarizeError(
+                f"Réponse Claude incomplète (stop_reason={response.stop_reason})"
+            )
+        text = next((b.text for b in response.content if b.type == "text"), None)
+        if text is None or not text.strip():
+            raise SummarizeError("API Claude : réponse sans bloc texte exploitable")
+        return str(text)

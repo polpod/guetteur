@@ -260,6 +260,20 @@ class SummaryMeta:
 class Summarizer(Protocol):
     def summarize(self, transcript: Transcript, meta: SummaryMeta) -> Summary: ...
 
+    def raw_call(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        json_schema: dict[str, Any] | None,
+        timeout_s: float,
+    ) -> str:
+        """Appel « brut » à Claude utilisé par les passes livre (plan JSON et
+        rédaction de chapitre). Même garde-fous que `summarize` côté backend :
+        aucun outil, settings utilisateur ignorés, clé API retirée de l'env sur
+        le backend claude_code. `json_schema` contraint la sortie quand il est
+        fourni (plan) ; `None` laisse le texte libre (chapitre Markdown)."""
+        ...
+
 
 def split_transcript(text: str, max_chars: int = CHUNK_CHARS) -> list[str]:
     """Découpe sur les fins de ligne pour ne jamais couper un segment horodaté."""

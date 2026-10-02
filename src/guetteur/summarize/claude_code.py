@@ -140,8 +140,11 @@ class ClaudeCodeSummarizer(ChunkedSummarizer):
 
     # --- exécution -------------------------------------------------------------------------
 
-    async def _run(self, args: list[str], stdin: str) -> CliResult:
+    async def _run(
+        self, args: list[str], stdin: str, timeout_s: float | None = None
+    ) -> CliResult:
         # Répertoire de travail vide : aucun CLAUDE.md de projet n'est chargé.
+        effective_timeout = timeout_s if timeout_s is not None else self._timeout_s
         with tempfile.TemporaryDirectory(prefix="guetteur-claude-") as cwd:
             try:
                 proc = await self._spawn(
@@ -163,13 +166,13 @@ class ClaudeCodeSummarizer(ChunkedSummarizer):
                 ) from exc
             try:
                 out, err = await asyncio.wait_for(
-                    proc.communicate(stdin.encode("utf-8")), timeout=self._timeout_s
+                    proc.communicate(stdin.encode("utf-8")), timeout=effective_timeout
                 )
             except TimeoutError as exc:
                 proc.kill()
                 await proc.wait()
                 raise ClaudeCodeTimeoutError(
-                    f"Claude Code n'a pas répondu en {self._timeout_s:.0f} s"
+                    f"Claude Code n'a pas répondu en {effective_timeout:.0f} s"
                 ) from exc
         return CliResult(
             returncode=proc.returncode if proc.returncode is not None else -1,
@@ -222,6 +225,42 @@ class ClaudeCodeSummarizer(ChunkedSummarizer):
         if isinstance(structured, dict):
             return structured
         raise ClaudeCodeError("Claude Code : champ result absent ou vide")
+
+    # --- raw_call (Lot 7 : passes livre) --------------------------------------------------
+
+    def raw_call(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        json_schema: dict[str, Any] | None,
+        timeout_s: float,
+    ) -> str:
+        """Appel brut via `claude -p` avec `--system-prompt`, et `--json-schema`
+        quand `json_schema` est fourni. Mêmes garde-fous que `summarize` : aucun
+        outil (`--tools ""`), permission plan, aucune session, settings utilisateur
+        ignorés, ANTHROPIC_API_KEY retirée de l'env (voir `_STRIPPED_ENV`).
+
+        Retourne la chaîne de résultat (JSON pour la passe plan, Markdown pour la
+        passe chapitre). Lève `ClaudeCodeError` si la sortie est vide ou illisible,
+        `ClaudeCodeTimeoutError` si le binaire dépasse `timeout_s`, et
+        `ClaudeCodeNotLoggedInError` si Claude Code n'est pas connecté."""
+        args = [
+            *self._base_args(user_prompt),
+            "--system-prompt",
+            system_prompt,
+        ]
+        if json_schema is not None:
+            args.extend(["--json-schema", json.dumps(json_schema, separators=(",", ":"))])
+        res = asyncio.run(self._run(args, "", timeout_s=timeout_s))
+        envelope = self._parse_envelope(res)
+        result = envelope.get("result")
+        if isinstance(result, str) and result.strip():
+            return result
+        structured = envelope.get("structured_output")
+        if isinstance(structured, dict):
+            # `--json-schema` sans réponse texte : on reconstruit le JSON.
+            return json.dumps(structured, ensure_ascii=False)
+        raise ClaudeCodeError("Claude Code : réponse vide pour un appel livre (raw_call)")
 
     # --- diagnostic ------------------------------------------------------------------------
 

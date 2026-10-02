@@ -142,3 +142,68 @@ def test_summary_json_roundtrip() -> None:
     raw = summary_to_json(summary)
     assert json.loads(raw)["title"] == "Titre résumé"
     assert summary_from_json(raw) == summary
+
+
+# --- raw_call (Lot 7 : passes livre) ------------------------------------
+
+
+def _fake_text_response(text: str, stop_reason: str = "end_turn") -> SimpleNamespace:
+    return SimpleNamespace(
+        stop_reason=stop_reason, content=[SimpleNamespace(type="text", text=text)]
+    )
+
+
+def test_raw_call_plan_passes_system_user_schema_and_timeout() -> None:
+    """Passe plan : system_prompt, user_prompt et schéma JSON passés au SDK ;
+    `timeout_s` propagé via `timeout` sur `messages.create`."""
+    client = fake_anthropic()
+    client.messages.create.side_effect = None
+    client.messages.create.return_value = _fake_text_response('{"titre": "T"}')
+
+    schema = {"type": "object", "properties": {"titre": {"type": "string"}}}
+    raw = ClaudeApiSummarizer(client, "claude-sonnet-4-6").raw_call(
+        "système plan", "utilisateur plan", schema, timeout_s=600.0
+    )
+    assert raw == '{"titre": "T"}'
+    kwargs = client.messages.create.call_args.kwargs
+    assert kwargs["system"] == "système plan"
+    assert kwargs["messages"] == [{"role": "user", "content": "utilisateur plan"}]
+    assert kwargs["output_config"]["format"] == {"type": "json_schema", "schema": schema}
+    assert kwargs["timeout"] == 600.0
+
+
+def test_raw_call_chapter_omits_output_config() -> None:
+    """Passe chapitre : pas de schéma, pas de `output_config` → sortie texte libre."""
+    client = fake_anthropic()
+    client.messages.create.side_effect = None
+    client.messages.create.return_value = _fake_text_response(
+        "## Section\n\nMarkdown libre."
+    )
+    raw = ClaudeApiSummarizer(client, "m").raw_call(
+        "sys", "usr", None, timeout_s=900.0
+    )
+    assert raw.startswith("## Section")
+    kwargs = client.messages.create.call_args.kwargs
+    assert "output_config" not in kwargs
+    assert kwargs["timeout"] == 900.0
+
+
+def test_raw_call_auth_error_marks_unavailable() -> None:
+    client = fake_anthropic()
+    request = httpx2.Request("POST", "https://api.anthropic.com/v1/messages")
+    response = httpx2.Response(401, request=request)
+    client.messages.create.side_effect = anthropic.AuthenticationError(
+        "invalid x-api-key", response=response, body=None
+    )
+    with pytest.raises(SummarizerUnavailableError):
+        ClaudeApiSummarizer(client, "m").raw_call("sys", "usr", None, timeout_s=1.0)
+
+
+def test_raw_call_max_tokens_truncation_raises() -> None:
+    client = fake_anthropic()
+    client.messages.create.side_effect = None
+    client.messages.create.return_value = _fake_text_response(
+        "partial", stop_reason="max_tokens"
+    )
+    with pytest.raises(SummarizeError):
+        ClaudeApiSummarizer(client, "m").raw_call("sys", "usr", None, timeout_s=1.0)

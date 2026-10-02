@@ -183,3 +183,67 @@ def test_ping() -> None:
     assert _flag(args, "-p") == "ping"
     assert _flag(args, "--output-format") == "json"
     assert "--json-schema" not in args
+
+
+# --- raw_call (Lot 7 : passes livre) ------------------------------------
+
+
+def test_raw_call_passes_system_prompt_user_prompt_and_schema() -> None:
+    """Un appel plan livre : système, utilisateur et schéma JSON transmis à
+    `claude -p`, mêmes garde-fous (--tools "", settings ignorés, ANTHROPIC_API_KEY
+    retirée). Timeout per-call appliqué."""
+    schema = {"type": "object", "properties": {"titre": {"type": "string"}}}
+    envelope = cli_envelope(json.dumps({"titre": "Un livre"}))
+    spawn = FakeSpawn(FakeProcess(stdout=envelope))
+    s = _summarizer(spawn, timeout_s=180.0)
+    raw = s.raw_call("system plan prompt", "user plan prompt", schema, timeout_s=600.0)
+    assert raw == json.dumps({"titre": "Un livre"})
+    args = spawn.calls[0][0]
+    assert _flag(args, "-p") == "user plan prompt"
+    assert _flag(args, "--system-prompt") == "system plan prompt"
+    assert _flag(args, "--json-schema") == json.dumps(schema, separators=(",", ":"))
+    assert _flag(args, "--tools") == ""
+    assert _flag(args, "--permission-mode") == "plan"
+    # Settings utilisateur ignorés et aucune session.
+    assert _flag(args, "--setting-sources") == ""
+    assert "--no-session-persistence" in args
+    assert "--strict-mcp-config" in args
+    # ANTHROPIC_API_KEY est bien retirée de l'environnement passé au subprocess.
+    env = spawn.calls[0][1].get("env", {})
+    assert "ANTHROPIC_API_KEY" not in env
+
+
+def test_raw_call_without_schema_omits_flag_and_returns_text() -> None:
+    """Passe chapitre : aucun --json-schema, Markdown libre."""
+    chapter_md = "## Sous-section\n\nContenu narratif."
+    envelope = cli_envelope(chapter_md)
+    spawn = FakeSpawn(FakeProcess(stdout=envelope))
+    raw = _summarizer(spawn).raw_call(
+        "system chapitre", "user chapitre", None, timeout_s=900.0
+    )
+    assert raw == chapter_md
+    args = spawn.calls[0][0]
+    assert "--json-schema" not in args
+
+
+def test_raw_call_timeout_uses_per_call_value() -> None:
+    """`timeout_s` paramètre l'appel courant, et non `self._timeout_s`."""
+    spawn = FakeSpawn(FakeProcess(hang=True))
+    s = _summarizer(spawn, timeout_s=600.0)
+    with pytest.raises(ClaudeCodeTimeoutError, match="0 s"):
+        s.raw_call("sys", "usr", None, timeout_s=0.05)
+    assert spawn.processes[0].killed
+
+
+def test_raw_call_not_logged_in() -> None:
+    envelope = cli_envelope("Not logged in · /login", is_error=True)
+    spawn = FakeSpawn(FakeProcess(stdout=envelope, returncode=1))
+    with pytest.raises(ClaudeCodeNotLoggedInError):
+        _summarizer(spawn).raw_call("sys", "usr", None, timeout_s=1.0)
+
+
+def test_raw_call_empty_response_raises() -> None:
+    envelope = cli_envelope("")
+    spawn = FakeSpawn(FakeProcess(stdout=envelope))
+    with pytest.raises(ClaudeCodeError):
+        _summarizer(spawn).raw_call("sys", "usr", None, timeout_s=1.0)

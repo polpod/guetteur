@@ -120,6 +120,16 @@ class FakeSummarizer:
         payload = self.payloads.get(meta.detail) or _default_payload(meta.detail)
         return to_summary(payload, detail=meta.detail)
 
+    def raw_call(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        json_schema: dict[str, Any] | None,
+        timeout_s: float,
+    ) -> str:
+        # Le bot Telegram n'utilise pas raw_call ; stub pour satisfaire le Protocol.
+        raise NotImplementedError("FakeSummarizer : raw_call non utilisé par le bot")
+
 
 def _default_payload(detail: DetailLevel) -> dict[str, Any]:
     if detail == "bref":

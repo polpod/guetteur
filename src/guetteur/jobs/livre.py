@@ -51,6 +51,9 @@ from guetteur.summarize.base import (
     summary_to_json,
 )
 from guetteur.summarize.book import (
+    CHAPTER_SYSTEM_PROMPT,
+    PLAN_SCHEMA,
+    PLAN_SYSTEM_PROMPT,
     BookPlan,
     ChapterSpec,
     build_chapter_prompt,
@@ -261,6 +264,7 @@ class LivreRunner:
         if row["status"] in ("done", "cancelled"):
             return str(row["status"])
         self._store.set_livre_status(livre_id, "running", started=True)
+        self._store.set_livre_phase(livre_id, "summarizing")
         detail = _detail_value(str(row["detail"]))
         n_done = 0
         while True:
@@ -369,9 +373,18 @@ def _detail_value(raw: str) -> DetailLevel:
 # --- passe de plan + rédaction des chapitres ---------------------------------
 
 
+Invoker = Callable[[str, str, dict[str, Any] | None, float], str]
+
+
 class BookAssembler:
-    """Deuxième et troisième passes Claude : plan JSON puis chapitres. Le
-    résultat est écrit dans le vault Obsidian et converti en EPUB/PDF."""
+    """Deuxième et troisième passes Claude : plan JSON puis chapitres, avec
+    reprise par chapitre après crash. Le résultat est écrit dans le vault
+    Obsidian et converti en EPUB/PDF.
+
+    Phase courante persistée en base (`livres.phase`) :
+    `planning` → `writing` → `rendering` → `done`. L'échec d'un chapitre
+    laisse les précédents en place (persistés dans `livre_chapters`), la
+    reprise ignore ceux déjà `done`."""
 
     def __init__(
         self,
@@ -380,12 +393,21 @@ class BookAssembler:
         summarizer: Summarizer,
         claude_lock: threading.Lock | None = None,
         max_chapter_prompt_chars: int = 90_000,
+        progress: ProgressReporter | None = None,
     ) -> None:
         self._config = config
         self._store = store
         self._summarizer = summarizer
         self._lock = claude_lock or threading.Lock()
         self._max = max_chapter_prompt_chars
+        self._progress = progress or (lambda _msg: None)
+        self._invoker: Invoker | None = None
+
+    def set_invoker(self, invoker: Invoker) -> None:
+        """Point d'extension pour les tests : remplace l'appel au `summarizer.raw_call`
+        par un callable `(system, user, schema, timeout) -> str`. En prod le
+        summarizer courant est utilisé directement, aucun invoker à poser."""
+        self._invoker = invoker
 
     def build(self, livre_id: int) -> BookOutput:
         row = self._store.get_livre(livre_id)
@@ -403,9 +425,20 @@ class BookAssembler:
             summaries[str(entry["video_id"])] = summary_from_json(raw)
         if not summaries:
             raise RuntimeError(f"livre {livre_id} : aucun résumé disponible pour la synthèse")
-        plan = self._build_plan(str(row["channel_name"]), summaries)
-        self._store.set_livre_plan(livre_id, json.dumps(_plan_to_dict(plan), ensure_ascii=False))
-        chapters = self._write_chapters(plan, summaries)
+
+        # --- Phase planning : on relit un plan existant si présent, sinon on
+        # appelle Claude. Permet de reprendre à l'étape writing sans refaire
+        # cet appel (coûteux et long).
+        self._store.set_livre_phase(livre_id, "planning")
+        plan = self._load_or_build_plan(livre_id, row, summaries)
+        self._store.init_livre_chapters(livre_id, [ch.titre for ch in plan.chapitres])
+
+        # --- Phase writing : chaque chapitre est persisté dès qu'il est terminé.
+        self._store.set_livre_phase(livre_id, "writing")
+        chapters = self._write_chapters(livre_id, plan, summaries)
+
+        # --- Phase rendering : assemblage Markdown + fichiers vault.
+        self._store.set_livre_phase(livre_id, "rendering")
         glossary = build_glossary(chapters)
         videos_meta = {
             str(e["video_id"]): (
@@ -431,58 +464,122 @@ class BookAssembler:
         self._store.set_livre_output(
             livre_id, output.livre_md.read_text(encoding="utf-8"), str(output.root)
         )
+        self._store.set_livre_phase(livre_id, "done")
         return output
 
+    def _load_or_build_plan(
+        self,
+        livre_id: int,
+        row: dict[str, Any],
+        summaries: dict[str, Summary],
+    ) -> BookPlan:
+        stored = row.get("plan_json")
+        if stored:
+            try:
+                return plan_from_dict(json.loads(stored))
+            except (json.JSONDecodeError, KeyError, TypeError) as exc:
+                log.warning(
+                    "livre.plan_reload_failed",
+                    extra={"livre_id": livre_id, "error": str(exc)},
+                )
+        plan = self._build_plan(str(row["channel_name"]), summaries)
+        self._store.set_livre_plan(
+            livre_id, json.dumps(_plan_to_dict(plan), ensure_ascii=False)
+        )
+        return plan
+
     def _build_plan(self, channel_name: str, summaries: dict[str, Summary]) -> BookPlan:
-        prompt = build_plan_prompt(channel_name, list(summaries.items()))
-        raw = self._call_claude(prompt, is_plan=True)
+        user_prompt = build_plan_prompt(channel_name, list(summaries.items()))
+        raw = self._raw_call(
+            system_prompt=PLAN_SYSTEM_PROMPT,
+            user_prompt=user_prompt,
+            json_schema=PLAN_SCHEMA,
+            timeout_s=self._config.livre.plan_timeout_s,
+        )
         return parse_plan(raw, list(summaries.keys()))
 
     def _write_chapters(
-        self, plan: BookPlan, summaries: dict[str, Summary]
+        self, livre_id: int, plan: BookPlan, summaries: dict[str, Summary]
     ) -> dict[str, str]:
+        """Rédige chaque chapitre et le persiste dès qu'il est terminé. Les
+        chapitres déjà `done` en base (reprise après crash) sont relus sans
+        rappeler Claude ; un chapitre `failed` est retenté."""
+        persisted = {int(c["rank"]): c for c in self._store.livre_chapters(livre_id)}
         chapters: dict[str, str] = {}
-        for ch in plan.chapitres:
-            triples: list[tuple[str, str, Summary]] = []
-            for vid in ch.video_ids:
-                if vid not in summaries:
-                    continue
-                triples.append(
-                    (vid, f"https://www.youtube.com/watch?v={vid}", summaries[vid])
+        total = len(plan.chapitres)
+        for rank, ch in enumerate(plan.chapitres):
+            existing = persisted.get(rank)
+            if existing and existing["status"] == "done" and existing.get("markdown"):
+                chapters[ch.titre] = str(existing["markdown"])
+                self._progress(
+                    f"📚 Livre {livre_id} : chapitre {rank + 1}/{total} déjà rédigé "
+                    f"({ch.titre}), reprise sans rappel Claude."
                 )
-            if not triples:
-                chapters[ch.titre] = f"# {ch.titre}\n\n*Aucune vidéo rattachée.*\n"
                 continue
-            parts: list[str] = []
-            for lot in chunk_chapter_videos(triples, self._max):
-                prompt = build_chapter_prompt(ch, lot)
-                parts.append(str(self._call_claude(prompt, is_plan=False)))
-            titles = [(vid, url, s.title) for (vid, url, s) in triples]
-            chapters[ch.titre] = render_chapter(ch, parts, titles)
+            self._store.set_livre_chapter(livre_id, rank, "writing")
+            self._progress(
+                f"📚 Livre {livre_id} : rédaction chapitre {rank + 1}/{total} ({ch.titre})"
+            )
+            try:
+                markdown = self._write_single_chapter(ch, summaries)
+            except Exception as exc:
+                self._store.set_livre_chapter(
+                    livre_id, rank, "failed", last_error=f"{type(exc).__name__}: {exc}"
+                )
+                raise
+            self._store.set_livre_chapter(livre_id, rank, "done", markdown=markdown)
+            chapters[ch.titre] = markdown
         return chapters
 
-    def _call_claude(self, prompt: str, is_plan: bool) -> Any:
-        """Point d'extension : par défaut on appelle un `summarizer._call_json`
-        générique si présent, sinon on lève. En pratique les tests injectent un
-        `summarizer` factice qui renvoie du JSON pour plan et du Markdown pour
-        chapitres. La prod branche un helper dédié."""
-        raw = self._invoke(prompt, is_plan)
-        if is_plan:
-            return raw
-        return raw
+    def _write_single_chapter(
+        self, ch: ChapterSpec, summaries: dict[str, Summary]
+    ) -> str:
+        triples: list[tuple[str, str, Summary]] = []
+        for vid in ch.video_ids:
+            if vid not in summaries:
+                continue
+            triples.append(
+                (vid, f"https://www.youtube.com/watch?v={vid}", summaries[vid])
+            )
+        if not triples:
+            return f"# {ch.titre}\n\n*Aucune vidéo rattachée.*\n"
+        parts: list[str] = []
+        for lot in chunk_chapter_videos(triples, self._max):
+            user_prompt = build_chapter_prompt(ch, lot)
+            parts.append(
+                self._raw_call(
+                    system_prompt=CHAPTER_SYSTEM_PROMPT,
+                    user_prompt=user_prompt,
+                    json_schema=None,
+                    timeout_s=self._config.livre.chapter_timeout_s,
+                )
+            )
+        titles = [(vid, url, s.title) for (vid, url, s) in triples]
+        return render_chapter(ch, parts, titles)
 
-    def _invoke(self, prompt: str, is_plan: bool) -> str:
-        """Duck-typing sur le summarizer : on cherche une méthode `raw_call`
-        (fournie par un adaptateur dédié en test) ou on lève."""
+    def _raw_call(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        json_schema: dict[str, Any] | None,
+        timeout_s: float,
+    ) -> str:
+        """Point d'entrée unique : si un invoker a été posé (tests), on l'utilise.
+        Sinon on délègue au `summarizer.raw_call` courant — c'est le chemin prod,
+        les deux backends `claude_code` et `claude_api` implémentent la méthode."""
+        if self._invoker is not None:
+            with self._lock:
+                return self._invoker(system_prompt, user_prompt, json_schema, timeout_s)
         raw_call = getattr(self._summarizer, "raw_call", None)
         if raw_call is None:
             raise RuntimeError(
                 "BookAssembler : le summarizer courant ne supporte pas raw_call — "
                 "utiliser BookAssembler.set_invoker() dans les tests ou brancher "
-                "un adaptateur en prod."
+                "un backend qui implémente raw_call (claude_code / claude_api)."
             )
         with self._lock:
-            return str(raw_call(prompt, is_plan))
+            return str(raw_call(system_prompt, user_prompt, json_schema, timeout_s))
 
 
 def _plan_to_dict(plan: BookPlan) -> dict[str, Any]:
@@ -551,12 +648,25 @@ def livre_status_text(store: Store, livre_id: int) -> str:
     total = sum(prog.values())
     done = prog.get("summarized", 0)
     failed = prog.get("failed", 0)
+    phase = row.get("phase")
     lines = [
         f"Livre {livre_id} — {row['title']}",
         f"Chaîne : {row['channel_name']} ({row['channel_url']})",
-        f"Statut : {row['status']}",
+        f"Statut : {row['status']}" + (f" (phase : {phase})" if phase else ""),
         f"Vidéos : {done}/{total} résumées, {failed} en échec",
     ]
+    chapter_prog = store.livre_chapter_progress(livre_id)
+    if chapter_prog:
+        total_c = sum(chapter_prog.values())
+        done_c = chapter_prog.get("done", 0)
+        failed_c = chapter_prog.get("failed", 0)
+        writing_c = chapter_prog.get("writing", 0)
+        detail_bits = [f"{done_c}/{total_c} rédigés"]
+        if writing_c:
+            detail_bits.append(f"{writing_c} en cours")
+        if failed_c:
+            detail_bits.append(f"{failed_c} en échec")
+        lines.append("Chapitres : " + ", ".join(detail_bits))
     if row.get("resume_after"):
         lines.append(f"Reprise après : {row['resume_after']}")
     if row.get("last_error"):

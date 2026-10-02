@@ -7,6 +7,7 @@ import json
 import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 from guetteur.config import (
     ApplicabilityConfig,
@@ -71,11 +72,12 @@ class FakeTranscriber:
 
 
 class RawCallSummarizer(Summarizer):
-    """Résume les vidéos ET répond aux passes plan / chapitre via `raw_call`."""
+    """Résume les vidéos ET répond aux passes plan / chapitre via `raw_call`
+    (signature 4-ary alignée sur les backends claude_code / claude_api)."""
 
     def __init__(self, plan_json: str, chapter_md: str) -> None:
         self.summary_calls: list[str] = []
-        self.raw_calls: list[tuple[str, bool]] = []
+        self.raw_calls: list[tuple[str, str, bool, float]] = []
         self._plan_json = plan_json
         self._chapter_md = chapter_md
 
@@ -91,8 +93,15 @@ class RawCallSummarizer(Summarizer):
             detail=meta.detail,
         )
 
-    def raw_call(self, prompt: str, is_plan: bool) -> str:
-        self.raw_calls.append((prompt[:40], is_plan))
+    def raw_call(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        json_schema: dict[str, Any] | None,
+        timeout_s: float,
+    ) -> str:
+        is_plan = json_schema is not None
+        self.raw_calls.append((system_prompt[:40], user_prompt[:40], is_plan, timeout_s))
         return self._plan_json if is_plan else self._chapter_md
 
 

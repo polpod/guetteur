@@ -162,6 +162,7 @@ CREATE TABLE IF NOT EXISTS livres (
     detail        TEXT NOT NULL DEFAULT 'standard',
     filters_json  TEXT NOT NULL DEFAULT '{}',
     status        TEXT NOT NULL DEFAULT 'pending',
+    phase         TEXT,
     plan_json     TEXT,
     book_md       TEXT,
     output_dir    TEXT,
@@ -189,6 +190,19 @@ CREATE TABLE IF NOT EXISTS livre_videos (
 );
 CREATE INDEX IF NOT EXISTS idx_livre_videos_status
     ON livre_videos(livre_id, status, rank);
+-- Chapitres d'un livre : persistance par chapitre pour reprise au chapitre
+-- suivant après un crash (Lot 7). Statuts : pending/writing/done/failed.
+-- `markdown` est renseigné quand status = 'done'.
+CREATE TABLE IF NOT EXISTS livre_chapters (
+    livre_id    INTEGER NOT NULL,
+    rank        INTEGER NOT NULL,
+    titre       TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'pending',
+    markdown    TEXT,
+    last_error  TEXT,
+    updated_at  TEXT NOT NULL,
+    PRIMARY KEY (livre_id, rank)
+);
 """
 )
 
@@ -291,29 +305,37 @@ class Store:
         """Lot 1 → Lot 2 : la contrainte CHECK du statut ne connaît pas « sending » et la
         colonne send_attempt_at manque. SQLite ne sait pas modifier une contrainte : on
         reconstruit la table en conservant toutes les lignes.
-        Lot 2 → Lot 3 : ajoute la colonne archived_at (nullable, ALTER TABLE suffit)."""
+        Lot 2 → Lot 3 : ajoute la colonne archived_at (nullable, ALTER TABLE suffit).
+        Lot 7 → Lot 7bis : ajoute `livres.phase` (nullable) pour suivre
+        summarizing / planning / writing / rendering."""
         row = self._conn.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'videos'"
         ).fetchone()
-        if row is None:
-            return  # base neuve : _SCHEMA crée tout
-        sql = str(row["sql"])
-        if "send_attempt_at" not in sql:
-            with self._tx() as conn:
-                conn.execute("ALTER TABLE videos RENAME TO videos_v1")
-                conn.execute("DROP INDEX IF EXISTS idx_videos_status")
-                conn.execute(_VIDEOS_DDL)
-                conn.execute(
-                    f"INSERT INTO videos ({_V1_COLUMNS}) SELECT {_V1_COLUMNS} FROM videos_v1"
+        if row is not None:
+            sql = str(row["sql"])
+            if "send_attempt_at" not in sql:
+                with self._tx() as conn:
+                    conn.execute("ALTER TABLE videos RENAME TO videos_v1")
+                    conn.execute("DROP INDEX IF EXISTS idx_videos_status")
+                    conn.execute(_VIDEOS_DDL)
+                    conn.execute(
+                        f"INSERT INTO videos ({_V1_COLUMNS}) SELECT {_V1_COLUMNS} "
+                        "FROM videos_v1"
+                    )
+                    conn.execute("DROP TABLE videos_v1")
+                sql = str(
+                    self._conn.execute(
+                        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'videos'"
+                    ).fetchone()["sql"]
                 )
-                conn.execute("DROP TABLE videos_v1")
-            sql = str(
-                self._conn.execute(
-                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'videos'"
-                ).fetchone()["sql"]
-            )
-        if "archived_at" not in sql:
-            self._conn.execute("ALTER TABLE videos ADD COLUMN archived_at TEXT")
+            if "archived_at" not in sql:
+                self._conn.execute("ALTER TABLE videos ADD COLUMN archived_at TEXT")
+        # Lot 7bis : ajout de la colonne `phase` sur une table livres existante.
+        livres_row = self._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'livres'"
+        ).fetchone()
+        if livres_row is not None and "phase" not in str(livres_row["sql"]):
+            self._conn.execute("ALTER TABLE livres ADD COLUMN phase TEXT")
 
     @contextmanager
     def _tx(self) -> Iterator[sqlite3.Connection]:
@@ -960,6 +982,76 @@ class Store:
             "UPDATE livres SET book_md = ?, output_dir = ?, updated_at = ? WHERE id = ?",
             (book_md, output_dir, _now(), livre_id),
         )
+
+    # --- phase & chapitres (Lot 7bis : reprise par chapitre) ----------------
+
+    LIVRE_PHASES = ("summarizing", "planning", "writing", "rendering", "done", "failed")
+
+    def set_livre_phase(self, livre_id: int, phase: str | None) -> None:
+        """Met à jour la phase courante du livre (indépendante du `status` global
+        qui reste running/paused/done). `None` efface la phase. Les valeurs
+        connues sont dans `LIVRE_PHASES` mais pas verrouillées en CHECK pour
+        permettre une évolution sans migration."""
+        if phase is not None and phase not in self.LIVRE_PHASES:
+            raise ValueError(f"phase inconnue : {phase!r}")
+        self._conn.execute(
+            "UPDATE livres SET phase = ?, updated_at = ? WHERE id = ?",
+            (phase, _now(), livre_id),
+        )
+
+    def init_livre_chapters(
+        self,
+        livre_id: int,
+        titles: Sequence[str],
+    ) -> None:
+        """Pré-remplit la table `livre_chapters` à partir du plan validé. Idempotent
+        via `INSERT OR IGNORE` : relancer la passe plan ne remet pas à zéro les
+        chapitres déjà rédigés."""
+        now = _now()
+        with self._tx() as conn:
+            for rank, titre in enumerate(titles):
+                conn.execute(
+                    "INSERT OR IGNORE INTO livre_chapters "
+                    "(livre_id, rank, titre, status, updated_at) "
+                    "VALUES (?, ?, ?, 'pending', ?)",
+                    (livre_id, rank, titre, now),
+                )
+
+    def livre_chapters(self, livre_id: int) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT * FROM livre_chapters WHERE livre_id = ? ORDER BY rank",
+            (livre_id,),
+        ).fetchall()
+        return [_row_to_dict(r) for r in rows]
+
+    def set_livre_chapter(
+        self,
+        livre_id: int,
+        rank: int,
+        status: str,
+        *,
+        markdown: str | None = None,
+        last_error: str | None = None,
+    ) -> None:
+        """Met à jour un chapitre. `markdown` et `last_error` sont écrits
+        uniquement s'ils sont fournis (COALESCE) — un échec garde le dernier
+        markdown éventuel, et un succès garde la dernière erreur pour trace."""
+        self._conn.execute(
+            "UPDATE livre_chapters SET status = ?, "
+            "markdown = COALESCE(?, markdown), "
+            "last_error = COALESCE(?, last_error), "
+            "updated_at = ? "
+            "WHERE livre_id = ? AND rank = ?",
+            (status, markdown, last_error, _now(), livre_id, rank),
+        )
+
+    def livre_chapter_progress(self, livre_id: int) -> dict[str, int]:
+        rows = self._conn.execute(
+            "SELECT status, COUNT(*) AS n FROM livre_chapters "
+            "WHERE livre_id = ? GROUP BY status",
+            (livre_id,),
+        ).fetchall()
+        return {str(r["status"]): int(r["n"]) for r in rows}
 
     def livre_videos(self, livre_id: int) -> list[dict[str, Any]]:
         rows = self._conn.execute(

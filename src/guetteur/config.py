@@ -156,6 +156,13 @@ class LivreConfig:
     estimated_minutes_per_video: float = 4.0
     # NotebookLM : archive optionnelle du livre + vidéos en sources (rotation ≥ 50).
     notebooklm: bool = False
+    # Timeout dédié à la passe plan (prod : 600 s). Le plan JSON doit tenir dans
+    # un seul appel même sur 150 vidéos.
+    plan_timeout_s: float = 600.0
+    # Timeout dédié à la passe chapitre (prod : 900 s). Rédiger 1500 à 4000
+    # mots à partir de 5 résumés dépasse régulièrement le défaut 180 s de
+    # `summarize`.
+    chapter_timeout_s: float = 900.0
 
 
 @dataclass(frozen=True)
@@ -478,6 +485,16 @@ def _parse_livre(raw: dict[str, Any]) -> LivreConfig:
         if detail_default == "detaille"
         else "standard"
     )
+    plan_timeout = raw.get("plan_timeout_s", default.plan_timeout_s)
+    chapter_timeout = raw.get("chapter_timeout_s", default.chapter_timeout_s)
+    if not isinstance(plan_timeout, int | float) or plan_timeout <= 0:
+        raise ConfigError(
+            f"livre.plan_timeout_s doit être un nombre positif (reçu : {plan_timeout!r})"
+        )
+    if not isinstance(chapter_timeout, int | float) or chapter_timeout <= 0:
+        raise ConfigError(
+            f"livre.chapter_timeout_s doit être un nombre positif (reçu : {chapter_timeout!r})"
+        )
     return LivreConfig(
         max_videos_default=_positive_int(
             raw.get("max_videos_default", default.max_videos_default),
@@ -495,6 +512,8 @@ def _parse_livre(raw: dict[str, Any]) -> LivreConfig:
         ),
         estimated_minutes_per_video=float(estimated),
         notebooklm=bool(raw.get("notebooklm", default.notebooklm)),
+        plan_timeout_s=float(plan_timeout),
+        chapter_timeout_s=float(chapter_timeout),
     )
 
 
