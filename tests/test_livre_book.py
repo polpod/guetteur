@@ -205,54 +205,67 @@ def test_write_book_creates_files(tmp_path: Path) -> None:
     assert len(out.chapter_files) == 2
 
 
-def test_run_pandoc_calls_binary_and_captures_paths(tmp_path: Path) -> None:
-    """Le vrai `pandoc` est mocké : on vérifie l'invocation et la présence
-    des drapeaux (TOC, xelatex, fontes DejaVu)."""
+def test_run_pandoc_builds_epub_only(tmp_path: Path) -> None:
+    """`run_pandoc` ne produit plus que l'EPUB ; aucun --pdf-engine, aucune
+    fonte LaTeX. Le PDF passe par `run_weasyprint` séparément."""
     import subprocess
 
     calls: list[list[str]] = []
 
     def fake_pandoc(cmd: list[str]) -> subprocess.CompletedProcess[str]:
         calls.append(cmd)
-        out_index = cmd.index("-o")
-        Path(cmd[out_index + 1]).write_bytes(b"produit")
+        Path(cmd[cmd.index("-o") + 1]).write_bytes(b"produit")
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     src = tmp_path / "livre.md"
     src.write_text("---\ntitle: X\n---\n# X\ncontenu.\n", encoding="utf-8")
-    epub, pdf = run_pandoc(
-        src,
-        tmp_path / "livre.epub",
-        tmp_path / "livre.pdf",
-        "Titre",
-        pandoc=fake_pandoc,
-    )
+    epub = run_pandoc(src, tmp_path / "livre.epub", "Titre", pandoc=fake_pandoc)
     assert epub is not None and epub.exists()
-    assert pdf is not None and pdf.exists()
-    assert len(calls) == 2
+    assert len(calls) == 1
     assert calls[0][0] == "pandoc"
     assert "--toc" in calls[0]
-    assert "--pdf-engine=xelatex" in calls[1]
-    assert any("DejaVu" in arg for arg in calls[1])
+    assert not any("xelatex" in a or "DejaVu" in a for a in calls[0])
 
 
-def test_run_pandoc_survives_pdf_failure(tmp_path: Path) -> None:
-    """L'échec de la génération PDF (pas de LaTeX installé) ne doit pas casser
-    la sortie EPUB, qui est le format principal."""
+def test_run_pandoc_returns_none_on_failure(tmp_path: Path) -> None:
     import subprocess
 
     def fake(cmd: list[str]) -> subprocess.CompletedProcess[str]:
-        if "--pdf-engine=xelatex" in cmd:
-            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="no xelatex")
-        out = cmd[cmd.index("-o") + 1]
-        Path(out).write_bytes(b"epub")
-        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="pandoc missing")
 
     src = tmp_path / "livre.md"
     src.write_text("# X", encoding="utf-8")
-    epub, pdf = run_pandoc(src, tmp_path / "livre.epub", tmp_path / "livre.pdf", "T", pandoc=fake)
-    assert epub is not None
-    assert pdf is None
+    epub = run_pandoc(src, tmp_path / "livre.epub", "T", pandoc=fake)
+    assert epub is None
+
+
+def test_run_weasyprint_skips_when_not_installed(tmp_path: Path) -> None:
+    """Sans l'extra `[pdf]`, `run_weasyprint` renvoie None sans toucher pandoc."""
+    import subprocess
+    import sys
+
+    from guetteur.export.livre_output import run_weasyprint
+
+    calls: list[list[str]] = []
+
+    def fake_pandoc(cmd: list[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    # Simule l'absence du module via sys.modules.
+    monkey = sys.modules.pop("weasyprint", None)
+    sys.modules["weasyprint"] = None  # type: ignore[assignment]
+    try:
+        src = tmp_path / "livre.md"
+        src.write_text("# X", encoding="utf-8")
+        pdf = run_weasyprint(src, tmp_path / "livre.pdf", "T", pandoc=fake_pandoc)
+        assert pdf is None
+        assert calls == []  # pas d'appel pandoc si weasyprint absent
+    finally:
+        if monkey is not None:
+            sys.modules["weasyprint"] = monkey
+        else:
+            sys.modules.pop("weasyprint", None)
 
 
 def test_build_glossary_picks_terms_across_chapters() -> None:

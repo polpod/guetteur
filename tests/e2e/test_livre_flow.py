@@ -195,12 +195,10 @@ def test_livre_flow_full_pipeline_to_epub(tmp_path: Path) -> None:
         assert len(output.chapter_files) == 3
         for path in output.chapter_files:
             assert path.exists()
-        # 5. Sortie Pandoc mockée (EPUB produit, PDF échoue par exemple).
+        # 5. Sortie Pandoc mockée : EPUB OK. PDF None car weasyprint absent dans
+        #    l'env de test (extra `[pdf]` non installé).
         def fake_pandoc(cmd: list[str]) -> subprocess.CompletedProcess[str]:
-            if "--pdf-engine=xelatex" in cmd:
-                return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="no latex")
-            out_path = Path(cmd[cmd.index("-o") + 1])
-            out_path.write_bytes(b"EPUB fictif")
+            Path(cmd[cmd.index("-o") + 1]).write_bytes(b"EPUB fictif")
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
         final = finalize(output, title="Livre Test", pandoc_runner=fake_pandoc)
@@ -214,3 +212,103 @@ def test_livre_flow_full_pipeline_to_epub(tmp_path: Path) -> None:
         assert final.epub.read_bytes().startswith(b"EPUB")
     finally:
         store.close()
+
+
+def test_publish_book_commits_in_bare_remote_and_sends_telegram(tmp_path: Path) -> None:
+    """Après la phase rendering, `publish_book` doit : (a) poser un commit
+    « GUETTEUR : livre … » dans le vault et le pousser vers le remote bare,
+    (b) envoyer `livre.epub` via sendDocument avec le chemin vault en caption."""
+    import httpx
+
+    from guetteur.export.livre_output import BookOutput
+    from guetteur.jobs.livre import publish_book
+    from guetteur.notify.telegram_bot import TelegramApi
+
+    # Dépôt bare qui joue le rôle de GitHub, branche initiale `main`.
+    remote = tmp_path / "remote.git"
+    subprocess.run(
+        ["git", "init", "--bare", "-b", "main", "-q", str(remote)], check=True
+    )
+    # Un commit initial pour que `git ls-remote` renvoie une HEAD (sinon
+    # `_git_sync` passe à côté du pull).
+    seed = tmp_path / "seed"
+    subprocess.run(["git", "init", "-b", "main", "-q", str(seed)], check=True)
+    for cfg in (
+        ["user.email", "guetteur@test"],
+        ["user.name", "Test"],
+        ["commit.gpgsign", "false"],
+    ):
+        subprocess.run(["git", "-C", str(seed), "config", *cfg], check=True)
+    (seed / "README.md").write_text("seed\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(seed), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(seed), "commit", "-qm", "seed"], check=True)
+    subprocess.run(
+        ["git", "-C", str(seed), "push", "-q", str(remote), "main"], check=True
+    )
+
+    # Vault clone du bare (comme en prod sur le LXC).
+    vault = tmp_path / "vault"
+    subprocess.run(["git", "clone", "-q", str(remote), str(vault)], check=True)
+    for cfg in (
+        ["user.email", "guetteur@test"],
+        ["user.name", "GUETTEUR"],
+        ["commit.gpgsign", "false"],
+    ):
+        subprocess.run(["git", "-C", str(vault), "config", *cfg], check=True)
+
+    livres_root = vault / "Livres" / "chaine-test"
+    (livres_root / "chapitres").mkdir(parents=True)
+    livre_md = livres_root / "livre.md"
+    livre_md.write_text("# Livre Test\n\nContenu.\n", encoding="utf-8")
+    epub_path = livres_root / "livre.epub"
+    epub_path.write_bytes(b"EPUB fictif")
+    output = BookOutput(
+        root=livres_root,
+        livre_md=livre_md,
+        index_md=livres_root / "_index.md",
+        chapter_files=(),
+        epub=epub_path,
+        pdf=None,
+    )
+
+    config = make_config(
+        tmp_path,
+        obsidian=ObsidianConfig(
+            enabled=True, path=vault, git_sync=True, git_remote=str(remote)
+        ),
+    )
+
+    # Faux Telegram : capture sendDocument.
+    doc_calls: list[tuple[str, bytes]] = []
+
+    def telegram_handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/sendDocument")
+        doc_calls.append((request.url.path, request.content))
+        return httpx.Response(200, json={"ok": True, "result": {"message_id": 1}})
+
+    client = httpx.Client(transport=httpx.MockTransport(telegram_handler))
+    bot = TelegramApi("TOKEN", client=client)
+
+    status = publish_book(output, title="Livre Test", config=config, bot=bot, chat_id="42")
+
+    assert status["git"] == "push_ok", status
+    assert status["telegram"] == "sent", status
+    # Le dépôt bare contient maintenant un commit « GUETTEUR : livre … ».
+    log_proc = subprocess.run(
+        ["git", "-C", str(remote), "log", "--pretty=%s"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "GUETTEUR : livre Livre Test" in log_proc.stdout
+    # `livre.epub` et `livre.md` sont bien committés.
+    files_proc = subprocess.run(
+        ["git", "-C", str(remote), "ls-tree", "-r", "--name-only", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "Livres/chaine-test/livre.md" in files_proc.stdout
+    assert "Livres/chaine-test/livre.epub" in files_proc.stdout
+    # Un seul appel sendDocument (EPUB — pas de PDF ici).
+    assert len(doc_calls) == 1

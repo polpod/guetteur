@@ -217,17 +217,15 @@ def pandoc_available() -> bool:
 def run_pandoc(
     book_md: Path,
     out_epub: Path,
-    out_pdf: Path,
     title: str,
     author: str = "GUETTEUR",
     pandoc: PandocRunner | None = None,
-) -> tuple[Path | None, Path | None]:
-    """Convertit `book_md` en EPUB et PDF. Retourne (epub_path, pdf_path) —
-    None quand la sortie a échoué. Ne lève pas : la génération PDF peut échouer
-    (moteur LaTeX absent) sans casser la génération EPUB, qui est le format
-    principal du livre."""
+) -> Path | None:
+    """Convertit `book_md` en EPUB. Retourne le chemin produit ou `None` si
+    pandoc échoue. Le PDF est désormais généré via `run_weasyprint` (plus de
+    LaTeX)."""
     runner = pandoc or _default_pandoc_run
-    common = [
+    cmd = [
         "pandoc",
         str(book_md),
         "--from=markdown+yaml_metadata_block",
@@ -237,45 +235,70 @@ def run_pandoc(
         f"title={title}",
         "--metadata",
         f"author={author}",
+        "-o",
+        str(out_epub),
     ]
-    epub_cmd = [*common, "-o", str(out_epub)]
-    epub_out: Path | None = None
     try:
-        res = runner(epub_cmd)
-        if res.returncode == 0 and out_epub.exists():
-            epub_out = out_epub
-        else:
-            log.warning(
-                "livre.pandoc_epub_failed",
-                extra={"returncode": res.returncode, "stderr": (res.stderr or "")[:300]},
-            )
+        res = runner(cmd)
     except (OSError, subprocess.SubprocessError) as exc:
         log.warning("livre.pandoc_epub_error", extra={"error": str(exc)})
-    pdf_cmd = [
-        *common,
-        "--pdf-engine=xelatex",
-        "-V",
-        "mainfont=DejaVu Serif",
-        "-V",
-        "sansfont=DejaVu Sans",
-        "-V",
-        "monofont=DejaVu Sans Mono",
-        "-o",
-        str(out_pdf),
-    ]
-    pdf_out: Path | None = None
+        return None
+    if res.returncode == 0 and out_epub.exists():
+        return out_epub
+    log.warning(
+        "livre.pandoc_epub_failed",
+        extra={"returncode": res.returncode, "stderr": (res.stderr or "")[:300]},
+    )
+    return None
+
+
+def run_weasyprint(
+    book_md: Path,
+    out_pdf: Path,
+    title: str,
+    pandoc: PandocRunner | None = None,
+) -> Path | None:
+    """Convertit `book_md` en PDF via pandoc→HTML puis weasyprint→PDF. Renvoie
+    `None` si weasyprint n'est pas installé (extra `[pdf]` optionnel) OU si une
+    étape échoue. Ne lève jamais — l'EPUB reste le format principal."""
     try:
-        res = runner(pdf_cmd)
-        if res.returncode == 0 and out_pdf.exists():
-            pdf_out = out_pdf
-        else:
-            log.warning(
-                "livre.pandoc_pdf_failed",
-                extra={"returncode": res.returncode, "stderr": (res.stderr or "")[:300]},
-            )
+        from weasyprint import HTML
+    except ImportError:
+        log.info("livre.weasyprint_not_installed")
+        return None
+    runner = pandoc or _default_pandoc_run
+    html_tmp = out_pdf.with_suffix(".html")
+    cmd = [
+        "pandoc",
+        str(book_md),
+        "--from=markdown+yaml_metadata_block",
+        "--toc",
+        "--toc-depth=2",
+        "--standalone",
+        "--metadata",
+        f"title={title}",
+        "-o",
+        str(html_tmp),
+    ]
+    try:
+        res = runner(cmd)
     except (OSError, subprocess.SubprocessError) as exc:
-        log.warning("livre.pandoc_pdf_error", extra={"error": str(exc)})
-    return epub_out, pdf_out
+        log.warning("livre.weasyprint_html_error", extra={"error": str(exc)})
+        return None
+    if res.returncode != 0 or not html_tmp.exists():
+        log.warning(
+            "livre.weasyprint_html_failed",
+            extra={"returncode": res.returncode, "stderr": (res.stderr or "")[:300]},
+        )
+        return None
+    try:
+        HTML(filename=str(html_tmp)).write_pdf(str(out_pdf))
+    except Exception as exc:
+        log.warning("livre.weasyprint_pdf_failed", extra={"error": str(exc)})
+        return None
+    finally:
+        html_tmp.unlink(missing_ok=True)
+    return out_pdf if out_pdf.exists() else None
 
 
 # --- glossaire heuristique ---------------------------------------------------
@@ -325,5 +348,6 @@ __all__ = [
     "render_book_markdown",
     "render_index",
     "run_pandoc",
+    "run_weasyprint",
     "write_book",
 ]

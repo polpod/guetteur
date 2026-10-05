@@ -32,6 +32,7 @@ from guetteur.export.livre_output import (
     BookOutput,
     build_glossary,
     run_pandoc,
+    run_weasyprint,
     write_book,
 )
 from guetteur.models import DetailLevel, Summary, Video
@@ -614,7 +615,7 @@ def plan_from_dict(data: dict[str, Any]) -> BookPlan:
     )
 
 
-# --- finaliser : pandoc + envoi Telegram --------------------------------------
+# --- finaliser : pandoc EPUB + weasyprint PDF ---------------------------------
 
 
 def finalize(
@@ -622,11 +623,15 @@ def finalize(
     title: str,
     pandoc_runner: Callable[[list[str]], subprocess.CompletedProcess[str]] | None = None,
 ) -> BookOutput:
-    """Convertit livre.md en EPUB + PDF via pandoc. Renvoie un `BookOutput`
-    enrichi avec les chemins produits (None si la conversion a échoué)."""
-    out_epub = output.root / "livre.epub"
-    out_pdf = output.root / "livre.pdf"
-    epub, pdf = run_pandoc(output.livre_md, out_epub, out_pdf, title=title, pandoc=pandoc_runner)
+    """Convertit livre.md en EPUB (pandoc) et PDF (weasyprint, extra `[pdf]`).
+    `None` sur chaque chemin si la génération échoue — l'EPUB reste le format
+    principal, le PDF est best-effort."""
+    epub = run_pandoc(
+        output.livre_md, output.root / "livre.epub", title=title, pandoc=pandoc_runner
+    )
+    pdf = run_weasyprint(
+        output.livre_md, output.root / "livre.pdf", title=title, pandoc=pandoc_runner
+    )
     return BookOutput(
         root=output.root,
         livre_md=output.livre_md,
@@ -635,6 +640,64 @@ def finalize(
         epub=epub,
         pdf=pdf,
     )
+
+
+# --- publication : git_sync + envoi Telegram ---------------------------------
+
+
+def _weasyprint_installed() -> bool:
+    try:
+        import weasyprint  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def publish_book(
+    output: BookOutput,
+    title: str,
+    config: Config,
+    bot: Any = None,
+    chat_id: str = "",
+) -> dict[str, str]:
+    """Après la phase rendering : commit dédié dans le vault via `_git_sync`
+    (message « GUETTEUR : livre <titre> », verrou + pull --rebase + push, repli
+    local sans remote), puis `sendDocument` de l'EPUB sur Telegram avec le
+    chemin vault en caption. Le PDF, s'il existe, est envoyé en second document.
+    Renvoie `{"git": ..., "telegram": ..., "pdf": ...}` pour affichage."""
+    from guetteur.export.obsidian import ObsidianExportError, _git_sync
+
+    status = {"git": "disabled", "telegram": "skipped", "pdf": "ok"}
+    if output.pdf is None:
+        status["pdf"] = "skipped (weasyprint absent — pip install guetteur[pdf])" \
+            if not _weasyprint_installed() else "failed"
+
+    if config.obsidian.git_sync:
+        try:
+            status["git"] = _git_sync(
+                config.obsidian.path,
+                f"GUETTEUR : livre {title}",
+                config.obsidian.git_remote,
+            )
+        except (ObsidianExportError, subprocess.TimeoutExpired) as exc:
+            log.warning("livre.git_failed", extra={"error": str(exc)})
+            status["git"] = "failed"
+
+    if bot is not None and chat_id and output.epub and output.epub.exists():
+        caption = (
+            f"✅ Livre « {title} » prêt.\n"
+            f"Vault : {output.root}\n"
+            f"Git : {status['git']} · PDF : {status['pdf']}"
+        )
+        try:
+            bot.send_document(chat_id, output.epub, caption=caption)
+            status["telegram"] = "sent"
+            if output.pdf and output.pdf.exists():
+                bot.send_document(chat_id, output.pdf, caption=f"PDF — {title}")
+        except Exception as exc:
+            log.warning("livre.telegram_failed", extra={"error": str(exc)})
+            status["telegram"] = "failed"
+    return status
 
 
 # --- helpers exposés pour la CLI/tests ---------------------------------------
@@ -744,5 +807,6 @@ __all__ = [
     "persist_new_livre",
     "plan_book",
     "plan_from_dict",
+    "publish_book",
     "resume_livre",
 ]

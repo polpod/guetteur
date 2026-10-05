@@ -851,7 +851,9 @@ def cmd_livre_run(config: Config, livre_id: int) -> int:
         LivreRunner,
         finalize,
         livre_status_text,
+        publish_book,
     )
+    from guetteur.notify.telegram_bot import TelegramApi
     from guetteur.summarize import build_summarizer
     from guetteur.transcript import Transcriber
     from guetteur.transcript.whisper import WhisperTranscriber
@@ -922,12 +924,25 @@ def cmd_livre_run(config: Config, livre_id: int) -> int:
             return _sp.run(cmd, capture_output=True, text=True, check=False)
 
         final = finalize(output, title=str(row["title"]), pandoc_runner=pandoc_call)
+        bot: TelegramApi | None = None
+        if config.secrets.telegram_bot_token and config.secrets.telegram_chat_id:
+            bot = TelegramApi(config.secrets.telegram_bot_token)
+        pub = publish_book(
+            final,
+            title=str(row["title"]),
+            config=config,
+            bot=bot,
+            chat_id=config.secrets.telegram_chat_id,
+        )
         store.set_livre_status(livre_id, "done", finished=True)
         print(f"✅ Livre {livre_id} prêt : {final.livre_md}")
         if final.epub:
-            print(f"   EPUB : {final.epub}")
+            print(f"   EPUB     : {final.epub}")
         if final.pdf:
-            print(f"   PDF  : {final.pdf}")
+            print(f"   PDF      : {final.pdf}")
+        print(f"   git      : {pub['git']}")
+        print(f"   telegram : {pub['telegram']}")
+        print(f"   pdf      : {pub['pdf']}")
     finally:
         store.close()
     return 0

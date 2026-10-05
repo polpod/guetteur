@@ -30,6 +30,11 @@ whisper = [
 notebooklm = [
     "notebooklm-py==0.8.3",
 ]
+# PDF du livre (Lot 7) : weasyprint HTML→PDF, pas de LaTeX. Sans cet extra la
+# phase rendering produit l'EPUB et saute le PDF silencieusement.
+pdf = [
+    "weasyprint>=63",
+]
 
 [build-system]
 requires = ["hatchling"]
@@ -72,6 +77,7 @@ module = [
     "faster_whisper.*",
     "google_auth_oauthlib.*",
     "notebooklm.*",
+    "weasyprint.*",
 ]
 ignore_missing_imports = true
 
