@@ -543,6 +543,21 @@ class ObsidianExporter:
         # commit intermédiaire. `export_video()` groupe note + idées en un seul commit.
         self._defer_commit: bool = False
 
+    # --- accès lecture seule aux chemins (utilisé par export/liens.py pour Lot 8) ----
+
+    @property
+    def inbox_path(self) -> Path:
+        return self._inbox
+
+    @property
+    def veille_path(self) -> Path:
+        return self._veille
+
+    def commit_now(self, message: str) -> None:
+        """Déclenche un commit immédiat (bypass `_defer_commit`). Utilisé par
+        les clients externes qui écrivent des notes hors du flux video."""
+        self._commit(message)
+
     # --- vault init -------------------------------------------------------------------
 
     def ensure_vault_layout(self) -> None:

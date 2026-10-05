@@ -24,11 +24,21 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
+from guetteur.items import (
+    ITEM_KINDS,
+    ITEM_PENDING,
+    ITEM_SOURCES,
+    ItemKind,
+    ItemSource,
+    ItemStatus,
+    LinkItem,
+    item_id_for,
+)
 from guetteur.models import Video
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 class Status(StrEnum):
@@ -43,6 +53,9 @@ class Status(StrEnum):
 
 PENDING_STATUSES = (Status.NEW, Status.RETRY, Status.TRANSCRIBED, Status.SUMMARIZED)
 _STATUS_CHECK = ", ".join(f"'{s.value}'" for s in Status)
+_ITEM_STATUS_CHECK = ", ".join(f"'{s.value}'" for s in ItemStatus)
+_ITEM_KIND_CHECK = ", ".join(f"'{k}'" for k in ITEM_KINDS)
+_ITEM_SOURCE_CHECK = ", ".join(f"'{s}'" for s in ITEM_SOURCES)
 
 _VIDEOS_DDL = f"""
 CREATE TABLE IF NOT EXISTS videos (
@@ -203,6 +216,33 @@ CREATE TABLE IF NOT EXISTS livre_chapters (
     updated_at  TEXT NOT NULL,
     PRIMARY KEY (livre_id, rank)
 );
+-- Lot 8 : items LIEN (tweets, articles, repos, youtube hors playlist). Table
+-- parallèle à `videos` : même machine à états, mais contenu texte, pas de
+-- transcript, pas de playlist. Ligne unique par `item_id` (sha1 de l'URL).
+CREATE TABLE IF NOT EXISTS items (
+    item_id         TEXT PRIMARY KEY,
+    kind            TEXT NOT NULL CHECK (kind IN ("""
+    + _ITEM_KIND_CHECK
+    + f""")),
+    url             TEXT NOT NULL,
+    source          TEXT NOT NULL CHECK (source IN ({_ITEM_SOURCE_CHECK})),
+    status          TEXT NOT NULL CHECK (status IN ({_ITEM_STATUS_CHECK})),
+    retries         INTEGER NOT NULL DEFAULT 0,
+    title           TEXT NOT NULL DEFAULT '',
+    author          TEXT NOT NULL DEFAULT '',
+    published_at    TEXT,
+    content         TEXT,
+    summary         TEXT,
+    last_error      TEXT,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL,
+    sent_at         TEXT,
+    send_attempt_at TEXT,
+    archived_at     TEXT,
+    theme           TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_items_status ON items(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_items_source ON items(source, created_at);
 """
 )
 
@@ -1087,6 +1127,263 @@ class Store:
             "UPDATE livre_videos SET status = ?, last_error = ?, updated_at = ? "
             "WHERE livre_id = ? AND video_id = ?",
             (status, last_error, _now(), livre_id, video_id),
+        )
+
+    # --- items LIEN (Lot 8) -----------------------------------------------------------------
+
+    def add_link(
+        self,
+        url: str,
+        kind: ItemKind,
+        source: ItemSource,
+        *,
+        mark_seen: bool = False,
+    ) -> tuple[str, bool]:
+        """Ajoute un item LIEN. Idempotent : retourne (item_id, inserted).
+
+        - inserted = True si la ligne a été créée ;
+        - mark_seen = True pour marquer comme déjà vu (status = sent, sent_at NULL),
+          utilisé au premier lancement d'un collecteur pour éviter de rejouer
+          tout l'historique. Les items marqués ainsi sont rejoignables par un
+          backfill ultérieur.
+        """
+        item_id = item_id_for(url)
+        status = ItemStatus.SENT if mark_seen else ItemStatus.NEW
+        now = _now()
+        cur = self._conn.execute(
+            "INSERT OR IGNORE INTO items (item_id, kind, url, source, status, "
+            "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (item_id, kind, url, source, status.value, now, now),
+        )
+        return item_id, cur.rowcount == 1
+
+    def get_item(self, item_id: str) -> LinkItem | None:
+        row = self._conn.execute("SELECT * FROM items WHERE item_id = ?", (item_id,)).fetchone()
+        return self._item(row) if row else None
+
+    def item_by_url(self, url: str) -> LinkItem | None:
+        return self.get_item(item_id_for(url))
+
+    def pending_items(self, limit: int = 50) -> list[LinkItem]:
+        placeholders = ",".join("?" for _ in ITEM_PENDING)
+        rows = self._conn.execute(
+            f"SELECT * FROM items WHERE status IN ({placeholders}) "
+            "ORDER BY created_at ASC LIMIT ?",
+            (*[s.value for s in ITEM_PENDING], limit),
+        ).fetchall()
+        return [self._item(r) for r in rows]
+
+    def list_items(
+        self,
+        limit: int = 50,
+        kind: ItemKind | None = None,
+        source: ItemSource | None = None,
+    ) -> list[LinkItem]:
+        sql = "SELECT * FROM items"
+        where: list[str] = []
+        params: list[str | int] = []
+        if kind is not None:
+            where.append("kind = ?")
+            params.append(kind)
+        if source is not None:
+            where.append("source = ?")
+            params.append(source)
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY updated_at DESC, created_at DESC LIMIT ?"
+        params.append(limit)
+        return [self._item(r) for r in self._conn.execute(sql, params).fetchall()]
+
+    def item_set_fetched(
+        self,
+        item_id: str,
+        *,
+        title: str,
+        author: str,
+        published_at: datetime | None,
+        content: str,
+    ) -> None:
+        self._conn.execute(
+            "UPDATE items SET status = ?, title = ?, author = ?, published_at = ?, "
+            "content = ?, last_error = NULL, updated_at = ? "
+            "WHERE item_id = ? AND status NOT IN (?, ?)",
+            (
+                ItemStatus.FETCHED.value,
+                title,
+                author,
+                _iso(published_at) if published_at else None,
+                content,
+                _now(),
+                item_id,
+                ItemStatus.SENT.value,
+                ItemStatus.SENDING.value,
+            ),
+        )
+
+    def item_set_summary(self, item_id: str, summary_json: str) -> None:
+        self._conn.execute(
+            "UPDATE items SET status = ?, summary = ?, last_error = NULL, updated_at = ? "
+            "WHERE item_id = ? AND status NOT IN (?, ?)",
+            (
+                ItemStatus.SUMMARIZED.value,
+                summary_json,
+                _now(),
+                item_id,
+                ItemStatus.SENT.value,
+                ItemStatus.SENDING.value,
+            ),
+        )
+
+    def item_claim_for_sending(self, item_id: str) -> bool:
+        now = _now()
+        cur = self._conn.execute(
+            "UPDATE items SET status = ?, send_attempt_at = ?, updated_at = ? "
+            "WHERE item_id = ? AND summary IS NOT NULL AND sent_at IS NULL "
+            "AND status NOT IN (?, ?, ?)",
+            (
+                ItemStatus.SENDING.value,
+                now,
+                now,
+                item_id,
+                ItemStatus.SENDING.value,
+                ItemStatus.SENT.value,
+                ItemStatus.FAILED.value,
+            ),
+        )
+        return cur.rowcount == 1
+
+    def item_mark_sent(self, item_id: str) -> bool:
+        now = _now()
+        cur = self._conn.execute(
+            "UPDATE items SET status = ?, sent_at = ?, last_error = NULL, updated_at = ? "
+            "WHERE item_id = ? AND status = ?",
+            (ItemStatus.SENT.value, now, now, item_id, ItemStatus.SENDING.value),
+        )
+        return cur.rowcount == 1
+
+    def item_release_claim(self, item_id: str, error: str) -> None:
+        self._conn.execute(
+            "UPDATE items SET status = ?, send_attempt_at = NULL, retries = retries + 1, "
+            "last_error = ?, updated_at = ? WHERE item_id = ? AND status = ?",
+            (ItemStatus.SUMMARIZED.value, error, _now(), item_id, ItemStatus.SENDING.value),
+        )
+
+    def item_mark_retry(self, item_id: str, error: str) -> int:
+        self._conn.execute(
+            "UPDATE items SET status = ?, retries = retries + 1, last_error = ?, updated_at = ? "
+            "WHERE item_id = ? AND status NOT IN (?, ?)",
+            (
+                ItemStatus.RETRY.value,
+                error,
+                _now(),
+                item_id,
+                ItemStatus.SENT.value,
+                ItemStatus.SENDING.value,
+            ),
+        )
+        row = self._conn.execute(
+            "SELECT retries FROM items WHERE item_id = ?", (item_id,)
+        ).fetchone()
+        return int(row["retries"]) if row else 0
+
+    def item_mark_failed(self, item_id: str, error: str) -> bool:
+        cur = self._conn.execute(
+            "UPDATE items SET status = ?, last_error = ?, send_attempt_at = NULL, updated_at = ? "
+            "WHERE item_id = ? AND status NOT IN (?, ?)",
+            (
+                ItemStatus.FAILED.value,
+                error,
+                _now(),
+                item_id,
+                ItemStatus.SENT.value,
+                ItemStatus.FAILED.value,
+            ),
+        )
+        return cur.rowcount == 1
+
+    def recover_stale_item_sending(
+        self, older_than: timedelta, now: datetime | None = None
+    ) -> list[str]:
+        cutoff = _iso((now or utcnow()) - older_than)
+        with self._tx() as conn:
+            ids = [
+                str(r["item_id"])
+                for r in conn.execute(
+                    "SELECT item_id FROM items WHERE status = ? "
+                    "AND (send_attempt_at IS NULL OR send_attempt_at < ?)",
+                    (ItemStatus.SENDING.value, cutoff),
+                ).fetchall()
+            ]
+            for iid in ids:
+                conn.execute(
+                    "UPDATE items SET status = ?, send_attempt_at = NULL, "
+                    "last_error = 'envoi interrompu, repris', updated_at = ? "
+                    "WHERE item_id = ?",
+                    (ItemStatus.SUMMARIZED.value, _now(), iid),
+                )
+        return ids
+
+    def item_mark_archived(self, item_id: str, now: datetime | None = None) -> bool:
+        stamp = _iso(now or utcnow())
+        cur = self._conn.execute(
+            "UPDATE items SET archived_at = ?, updated_at = ? "
+            "WHERE item_id = ? AND status = ? AND archived_at IS NULL",
+            (stamp, stamp, item_id, ItemStatus.SENT.value),
+        )
+        return cur.rowcount == 1
+
+    def item_set_theme(self, item_id: str, theme: str) -> None:
+        self._conn.execute(
+            "UPDATE items SET theme = ?, updated_at = ? WHERE item_id = ?",
+            (theme, _now(), item_id),
+        )
+
+    def items_sent_since(self, since: datetime) -> list[LinkItem]:
+        """Items réellement envoyés depuis `since` (digest hebdomadaire)."""
+        rows = self._conn.execute(
+            "SELECT * FROM items WHERE status = ? AND sent_at IS NOT NULL AND sent_at >= ? "
+            "ORDER BY sent_at ASC",
+            (ItemStatus.SENT.value, _iso(since)),
+        ).fetchall()
+        return [self._item(r) for r in rows]
+
+    def videos_kept_since(self, since: datetime) -> list[VideoRecord]:
+        """Vidéos envoyées dont la note Obsidian a été déplacée hors Inbox (gardées)."""
+        rows = self._conn.execute(
+            "SELECT v.* FROM videos v JOIN obsidian_notes n ON v.video_id = n.video_id "
+            "WHERE v.status = ? AND v.sent_at IS NOT NULL AND v.sent_at >= ? "
+            "AND n.status <> 'inbox' AND n.status <> 'ecarte' "
+            "ORDER BY v.sent_at ASC",
+            (Status.SENT.value, _iso(since)),
+        ).fetchall()
+        return [self._record(r) for r in rows]
+
+    @staticmethod
+    def _item(row: sqlite3.Row) -> LinkItem:
+        published = row["published_at"]
+        return LinkItem(
+            item_id=str(row["item_id"]),
+            kind=cast(ItemKind, str(row["kind"])),
+            url=str(row["url"]),
+            source=cast(ItemSource, str(row["source"])),
+            status=ItemStatus(row["status"]),
+            retries=int(row["retries"]),
+            title=str(row["title"]),
+            author=str(row["author"]),
+            published_at=datetime.fromisoformat(published) if published else None,
+            content=row["content"],
+            summary=row["summary"],
+            last_error=row["last_error"],
+            created_at=datetime.fromisoformat(row["created_at"]),
+            updated_at=datetime.fromisoformat(row["updated_at"]),
+            sent_at=datetime.fromisoformat(row["sent_at"]) if row["sent_at"] else None,
+            send_attempt_at=(
+                datetime.fromisoformat(row["send_attempt_at"]) if row["send_attempt_at"] else None
+            ),
+            archived_at=(
+                datetime.fromisoformat(row["archived_at"]) if row["archived_at"] else None
+            ),
+            theme=str(row["theme"]),
         )
 
     def _update(

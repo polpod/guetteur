@@ -1,0 +1,13 @@
+[Unit]
+Description=GUETTEUR : digest hebdomadaire (dimanche 18 h, heure du serveur)
+Documentation=https://github.com/polpod/guetteur
+
+[Timer]
+# Dimanche 18:00 locale. `Persistent=true` déclenche le run manqué si la machine
+# était off à l'heure dite.
+OnCalendar=Sun 18:00
+Persistent=true
+RandomizedDelaySec=5min
+
+[Install]
+WantedBy=timers.target

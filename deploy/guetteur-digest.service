@@ -1,0 +1,23 @@
+[Unit]
+Description=GUETTEUR : digest hebdomadaire des liens et vidéos gardés
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=guetteur
+Group=guetteur
+WorkingDirectory=/opt/guetteur
+Environment=PATH=/opt/guetteur/.venv/bin:/usr/bin:/bin
+EnvironmentFile=-/opt/guetteur/.env
+ExecStart=/opt/guetteur/.venv/bin/guetteur digest --since 7d
+# Durcissement systemd : service non interactif, pas de capabilities étendues.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/guetteur/data /opt/guetteur/vault
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true

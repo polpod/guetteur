@@ -429,6 +429,8 @@ class TelegramBot:
         api: TelegramApi | None = None,
         get_playlist: Callable[[str], PlaylistConfig] | None = None,
         pipeline_process: Callable[[str, DetailLevel | None], None] | None = None,
+        link_processor: Callable[[str, str], str] | None = None,
+        digest_runner: Callable[[str], None] | None = None,
         now: Callable[[], datetime] | None = None,
     ) -> None:
         secrets = config.secrets
@@ -444,6 +446,10 @@ class TelegramBot:
         self._chat_id = secrets.telegram_chat_id
         self._get_playlist = get_playlist or (lambda _: PlaylistConfig(id="", label="Veille"))
         self._pipeline_process = pipeline_process
+        # Lot 8 : traitement d'un lien partagé — reçoit (url, source) et retourne un item_id.
+        self._link_processor = link_processor
+        # Lot 8 : digest hebdomadaire — reçoit un spec `--since` ("7d" par défaut).
+        self._digest_runner = digest_runner
         self._now = now or (lambda: datetime.now(UTC))
         self._rate_limit = RateLimiter(config.telegram.rate_limit_per_hour, now=self._now)
         self._stop_flag = threading.Event()
@@ -550,6 +556,13 @@ class TelegramBot:
             if video_id:
                 self._answer_question(video_id, text)
                 return
+        # Lot 8 : URL dans le message (hors reply, hors commande) = lien à analyser.
+        from guetteur.sources.liens.extract import extract_urls
+
+        urls = extract_urls(text)
+        if urls:
+            self._process_shared_urls(urls, source="telegram")
+            return
         # Sinon : y a-t-il une question en attente ?
         video_id = self._awaiting_video()
         if video_id:
@@ -558,8 +571,28 @@ class TelegramBot:
             return
         self._send_plain(
             "Je n'ai pas trouvé de vidéo liée à ce message. Réponds à un résumé, "
-            "appuie sur « Question » sous un résumé, ou tape /help."
+            "appuie sur « Question » sous un résumé, partage une URL, "
+            "ou tape /help."
         )
+
+    def _process_shared_urls(self, urls: list[str], *, source: str) -> None:
+        """Lot 8 : ACK immédiat puis traitement de chaque URL via `link_processor`.
+        Un échec sur une URL ne bloque pas les suivantes."""
+        if self._link_processor is None:
+            self._send_plain("Traitement des liens désactivé (link_processor absent).")
+            return
+        n = len(urls)
+        self._send_plain(
+            "Lien reçu, analyse en cours."
+            if n == 1
+            else f"{n} liens reçus, analyse en cours."
+        )
+        for url in urls:
+            try:
+                self._link_processor(url, source)
+            except Exception as exc:
+                log.exception("telegram_bot.link_failed", extra={"url": url})
+                self._send_plain(f"Échec sur {url} : {type(exc).__name__} — {exc}")
 
     # --- callback_query -----------------------------------------------------------------
 
@@ -849,7 +882,63 @@ class TelegramBot:
         if cmd == "/livres":
             self._cmd_livres_list()
             return
+        if cmd == "/lien":
+            self._cmd_lien(args)
+            return
+        if cmd == "/liens":
+            self._cmd_liens()
+            return
+        if cmd == "/digest":
+            self._cmd_digest(args)
+            return
         self._send_plain(f"Commande inconnue : {cmd}. /help pour la liste.")
+
+    def _cmd_lien(self, args: list[str]) -> None:
+        """`/lien <URL>` : traite explicitement une URL comme un lien à résumer."""
+        from guetteur.sources.liens.extract import extract_urls
+
+        if not args:
+            self._send_plain("Usage : /lien <URL>")
+            return
+        urls = extract_urls(" ".join(args))
+        if not urls:
+            self._send_plain("Aucune URL http(s) trouvée dans l'argument.")
+            return
+        self._process_shared_urls(urls, source="telegram")
+
+    def _cmd_liens(self) -> None:
+        """`/liens` : 10 derniers items LIEN envoyés."""
+        items = [i for i in self._store.list_items(limit=20) if i.really_sent][:10]
+        if not items:
+            self._send_plain("Aucun lien envoyé pour le moment.")
+            return
+        lines = ["*10 derniers liens*", ""]
+        for item in items:
+            label = {
+                "tweet": "📎",
+                "article": "📰",
+                "github": "🐙",
+                "youtube_oneshot": "🎞️",
+            }.get(item.kind, "🔗")
+            title = (item.title or item.url)[:70]
+            lines.append(f"{label} [{title}]({item.url})")
+        self._api.send_message(
+            self._chat_id,
+            "\n".join(lines),
+            parse_mode="MarkdownV2",
+        )
+
+    def _cmd_digest(self, args: list[str]) -> None:
+        """`/digest [spec]` : déclenche un digest. spec défaut 7d."""
+        if self._digest_runner is None:
+            self._send_plain("Digest désactivé (runner absent).")
+            return
+        spec = args[0] if args else "7d"
+        try:
+            self._digest_runner(spec)
+        except Exception as exc:
+            log.exception("telegram_bot.digest_failed")
+            self._send_plain(f"Digest : échec — {type(exc).__name__} : {exc}")
 
     def _cmd_livre_create(self, args: list[str]) -> None:
         """`/livre <URL> [--order date|views|duration] [--max N]` : crée un job
@@ -1109,6 +1198,9 @@ class TelegramBot:
             "/livre <URL> [--order date|views|duration] [--max N] — crée un job de "
             "compilation d'une chaîne YouTube en ebook\n"
             "/livres — liste les livres en base et leur état\n"
+            "/lien <URL> — analyse et résume un lien (tweet, article, repo, vidéo)\n"
+            "/liens — 10 derniers liens envoyés\n"
+            "/digest [7d|24h|…] — digest hebdomadaire des liens et vidéos gardés\n"
             "/help — cette aide\n\n"
             "Réponds à n'importe quel message de résumé pour poser une question sur la vidéo, "
             "ou utilise le bouton « Question »."

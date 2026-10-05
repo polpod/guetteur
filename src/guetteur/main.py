@@ -218,6 +218,11 @@ def _maybe_start_bot(config: Config, store: Store, pipeline: Pipeline, claude_lo
             except ConfigError:
                 return PlaylistConfig(id=playlist_id, label=playlist_id)
 
+        # Lot 8 : pipeline des liens — même backend (summarizer), même lock Claude.
+        link_processor, digest_runner = _build_link_handlers(
+            config, store, summarizer, notifier, claude_lock
+        )
+
         bot = TelegramBot(
             config=config,
             store=store,
@@ -226,12 +231,184 @@ def _maybe_start_bot(config: Config, store: Store, pipeline: Pipeline, claude_lo
             claude_lock=claude_lock,
             notifier=notifier,
             get_playlist=playlist_for,
+            link_processor=link_processor,
+            digest_runner=digest_runner,
         )
         bot.start()
         return bot
     except Exception:
         log.exception("telegram_bot.start_failed")
         return None
+
+
+def _build_link_handlers(
+    config: Config,
+    store: Store,
+    summarizer: Any,
+    notifier: Any,
+    claude_lock: Any,
+) -> tuple[Any, Any]:
+    """Construit les deux callbacks utilisés par le bot pour les liens (Lot 8).
+
+    - link_processor(url, source) → item_id : add_link + process via LinkPipeline.
+    - digest_runner(spec) : construit et envoie un digest Telegram + note Obsidian.
+    """
+    from guetteur.items import ItemSource
+    from guetteur.jobs.digest import build_digest, parse_since, send_digest
+    from guetteur.pipeline_link import LinkPipeline
+    from guetteur.sources.liens.extract import detect_kind
+
+    # Un seul `LinkPipeline` partagé entre les URL partagées (branché sur
+    # `summarizer.raw_call` et sur l'exporter Obsidian si configuré).
+    exporter_cb = None
+    exporter_obj = None
+    if config.obsidian.enabled:
+        from guetteur.export import write_link_note
+        from guetteur.export.obsidian import ObsidianExporter
+
+        exporter_obj = ObsidianExporter(config, store)
+
+        def _write(item, summary):  # type: ignore[no-untyped-def]
+            write_link_note(exporter_obj, item, summary)
+
+        exporter_cb = _write
+
+    archiver_obj = None
+    if config.archive.enabled:
+        try:
+            from guetteur.archive.notebooklm import NotebookLMArchiver
+
+            archiver_obj = NotebookLMArchiver(config.archive, store)
+        except Exception:
+            log.exception("link_pipeline.archiver_init_failed")
+
+    link_pipeline = LinkPipeline(
+        config=config,
+        store=store,
+        backend=summarizer,
+        notifier_factory=lambda ch: notifier,
+        exporter=exporter_cb,
+        archiver=archiver_obj,
+        claude_lock=claude_lock,
+        timeout_s=config.summarize.timeout_s,
+    )
+
+    valid_sources = ("telegram", "cli", "x_retweets", "x_bookmarks")
+
+    def _link_processor(url: str, source_name: str) -> str:
+        src: ItemSource = source_name if source_name in valid_sources else "cli"  # type: ignore[assignment]
+        kind = detect_kind(url)
+        item_id, _ = store.add_link(url, kind, src)
+        link_pipeline.process(item_id)
+        return item_id
+
+    def _digest_runner(spec: str) -> None:
+        since = parse_since(spec)
+        digest = build_digest(store, since)
+        send_digest(digest, notifier, exporter=exporter_obj)
+
+    return _link_processor, _digest_runner
+
+
+def cmd_lien(config: Config, url: str) -> int:
+    """Analyse un lien depuis la CLI (sans bot). Résumé affiché, pas de notif."""
+    import threading
+
+    from guetteur.items import ItemSource
+    from guetteur.pipeline_link import LinkPipeline
+    from guetteur.sources.liens.extract import detect_kind
+    from guetteur.summarize import build_summarizer
+
+    store = Store(config.db_path)
+    try:
+        summarizer = build_summarizer(config)
+        notifier = _console_notifier()
+        lock = threading.Lock()
+
+        exporter_cb = None
+        if config.obsidian.enabled:
+            from guetteur.export import write_link_note
+            from guetteur.export.obsidian import ObsidianExporter
+
+            exporter = ObsidianExporter(config, store)
+
+            def _write(item, summary):  # type: ignore[no-untyped-def]
+                write_link_note(exporter, item, summary)
+
+            exporter_cb = _write
+
+        pipeline = LinkPipeline(
+            config=config,
+            store=store,
+            backend=summarizer,
+            notifier_factory=lambda ch: notifier,
+            exporter=exporter_cb,
+            claude_lock=lock,
+            timeout_s=config.summarize.timeout_s,
+        )
+        kind = detect_kind(url)
+        src: ItemSource = "cli"
+        item_id, _ = store.add_link(url, kind, src)
+        outcome = pipeline.process(item_id)
+        print(f"[{outcome}] item_id={item_id} kind={kind}")
+        return 0 if outcome in ("sent", "delegated") else 1
+    finally:
+        store.close()
+
+
+def cmd_liens(config: Config) -> int:
+    store = Store(config.db_path)
+    try:
+        items = [i for i in store.list_items(limit=50) if i.really_sent][:10]
+        if not items:
+            print("Aucun lien envoyé.")
+            return 0
+        for item in items:
+            print(f"{item.kind:10s}  {item.sent_at}  {item.title or item.url}  {item.url}")
+        return 0
+    finally:
+        store.close()
+
+
+def cmd_digest(config: Config, since_spec: str) -> int:
+    from guetteur.jobs.digest import build_digest, parse_since, render_digest_markdown
+
+    store = Store(config.db_path)
+    try:
+        since = parse_since(since_spec)
+        digest = build_digest(store, since)
+        print(render_digest_markdown(digest))
+
+        if config.obsidian.enabled:
+            from guetteur.export.obsidian import ObsidianExporter
+            from guetteur.jobs.digest import write_digest_note
+
+            exporter = ObsidianExporter(config, store)
+            path = write_digest_note(exporter, digest)
+            print(f"[obsidian] {path}", file=sys.stderr)
+
+        if config.secrets.telegram_bot_token and config.secrets.telegram_chat_id:
+            from guetteur.jobs.digest import render_digest_telegram
+            from guetteur.notify.telegram import TelegramNotifier
+
+            notifier = TelegramNotifier(
+                config.secrets.telegram_bot_token, config.secrets.telegram_chat_id
+            )
+            notifier.send(render_digest_telegram(digest))
+            print("[telegram] envoyé", file=sys.stderr)
+        return 0
+    finally:
+        store.close()
+
+
+def _console_notifier() -> Any:
+    """Petit notifier qui écrit un résumé sur stdout, utilisé par `guetteur lien`."""
+
+    class _Console:
+        def send(self, message: Message) -> None:
+            print(message.plain)
+
+    return _Console()
 
 
 def cmd_backfill(
@@ -1113,6 +1290,14 @@ def build_parser() -> argparse.ArgumentParser:
     au = sub.add_parser("auth", help="autorisation OAuth pour les playlists privées")
     au.add_argument("--port", type=int, default=8765)
     au.add_argument("--bind", default="127.0.0.1", help="adresse d'écoute (0.0.0.0 dans Docker)")
+    # Lot 8 : commandes LIEN et digest.
+    lp = sub.add_parser("lien", help="analyse et résume une URL partagée")
+    lp.add_argument("url", help="URL http(s) à analyser")
+    sub.add_parser("liens", help="liste les 10 derniers liens envoyés")
+    dg = sub.add_parser("digest", help="digest hebdomadaire : Telegram + Obsidian")
+    dg.add_argument(
+        "--since", default="7d", help='fenêtre : "7d", "24h", "2w" ou ISO date (défaut 7d)'
+    )
     return parser
 
 
@@ -1170,6 +1355,12 @@ def cli(argv: Sequence[str] | None = None) -> int:
                         return 2
             case "auth":
                 return cmd_auth(config, args.port, args.bind)
+            case "lien":
+                return cmd_lien(config, args.url)
+            case "liens":
+                return cmd_liens(config)
+            case "digest":
+                return cmd_digest(config, args.since)
     except (ConfigError, SourceError) as exc:
         print(f"❌ {exc}", file=sys.stderr)
         return 2
