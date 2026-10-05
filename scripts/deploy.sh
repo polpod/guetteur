@@ -75,9 +75,11 @@ fi
 
 # --extra notebooklm est TOUJOURS ajouté : sans lui, uv sync désinstalle
 # notebooklm-py du venv et l'archivage casse au prochain cycle (bug prod).
+# --extra pdf (weasyprint) est TOUJOURS ajouté aussi : Lot 7 — sans lui, la
+# phase rendering du livre skippe silencieusement le PDF.
 # --extra whisper est plus lourd : on l'ajoute seulement si config.toml le
 # demande, pour ne pas gonfler le venv sur les instances qui n'en veulent pas.
-extras=(--extra notebooklm)
+extras=(--extra notebooklm --extra pdf)
 if whisper_wanted "$INSTALL_DIR/config.toml"; then
     extras+=(--extra whisper)
 fi

@@ -344,11 +344,14 @@ chmod -R go-w "$INSTALL_DIR" # une copie depuis NTFS arrive en 777
 
 log "Python 3.12 et dépendances (uv sync --no-dev)"
 # --extra notebooklm est TOUJOURS ajouté : le wheel est petit et l'omettre
-# désinstalle notebooklm-py du venv à chaque redéploiement (bug prod). --extra
-# whisper est plus lourd (faster-whisper + torch) : on ne l'ajoute que si
-# demandé — soit via WITH_WHISPER=1 (option de la commande), soit via
+# désinstalle notebooklm-py du venv à chaque redéploiement (bug prod).
+# --extra pdf (weasyprint) est TOUJOURS ajouté aussi : Lot 7 — sans lui, la
+# phase rendering du livre skippe silencieusement le PDF. Weasyprint tire
+# libpango/libcairo (déjà présents sur Ubuntu LXC via libpango-1.0-0).
+# --extra whisper est plus lourd (faster-whisper + torch) : on ne l'ajoute que
+# si demandé — soit via WITH_WHISPER=1 (option de la commande), soit via
 # [transcript] whisper_enabled = true dans config.toml.
-extra=(--extra notebooklm)
+extra=(--extra notebooklm --extra pdf)
 if [[ "$WITH_WHISPER" == "1" ]] || whisper_wanted "$INSTALL_DIR/config.toml"; then
     extra+=(--extra whisper)
 fi

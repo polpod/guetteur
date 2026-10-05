@@ -361,15 +361,17 @@ INSTALL_SCRIPT = SCRIPTS_DIR / "install-lxc.sh"
     [DEPLOY_SCRIPT, INSTALL_SCRIPT],
     ids=lambda p: p.name,
 )
-def test_uv_sync_always_carries_extra_notebooklm(script: Path) -> None:
+def test_uv_sync_always_carries_extra_notebooklm_and_pdf(script: Path) -> None:
     """Régression : sans --extra notebooklm, uv sync désinstalle notebooklm-py
-    du venv à chaque redéploiement et l'archivage casse au cycle suivant. Les
-    deux scripts DOIVENT pousser cet extra sans condition (le wheel est petit)."""
+    du venv à chaque redéploiement et l'archivage casse au cycle suivant.
+    Sans --extra pdf (Lot 7), weasyprint est désinstallé et la phase rendering
+    du livre skippe silencieusement le PDF. Les deux extras sont ajoutés sans
+    condition (petits wheels, pas de LaTeX)."""
     src = script.read_text(encoding="utf-8")
-    # L'extra apparaît dans un array bash initialisé avant l'appel uv sync.
-    assert re.search(r"(?:extra|extras)=\(--extra notebooklm\)", src), (
-        f"{script.name} : --extra notebooklm doit être ajouté systématiquement"
-    )
+    # Les deux extras apparaissent dans l'array initial, dans l'ordre.
+    assert re.search(
+        r"(?:extra|extras)=\(--extra notebooklm --extra pdf\)", src
+    ), f"{script.name} : --extra notebooklm --extra pdf doivent être ajoutés systématiquement"
 
 
 def test_deploy_sh_runs_doctor_and_fails_on_ko() -> None:
