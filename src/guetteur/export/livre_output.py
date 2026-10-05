@@ -262,10 +262,22 @@ def run_weasyprint(
     `None` si weasyprint n'est pas installé (extra `[pdf]` optionnel) OU si une
     étape échoue. Ne lève jamais — l'EPUB reste le format principal."""
     try:
-        from weasyprint import HTML
+        from weasyprint import HTML, default_url_fetcher
     except ImportError:
         log.info("livre.weasyprint_not_installed")
         return None
+
+    # Garde SSRF / LFI : la source HTML est générée depuis le Markdown d'un
+    # chapitre rédigé par Claude, qui s'appuie sur des métadonnées YouTube
+    # (titres de vidéos) non filtrables. Un `<img src="file:///etc/passwd">` ou
+    # `<img src="http://169.254.169.254/…">` glissé dans la sortie modèle
+    # ferait lire le fichier / l'IP par weasyprint lors du rendu. On autorise
+    # seulement les URIs `data:` (images embarquées légitimes).
+    def _safe_fetcher(url: str) -> dict[str, Any]:
+        if url.startswith("data:"):
+            return dict(default_url_fetcher(url))
+        log.warning("livre.weasyprint_url_blocked", extra={"url": url[:120]})
+        return {"string": b"", "mime_type": "text/plain"}
     runner = pandoc or _default_pandoc_run
     html_tmp = out_pdf.with_suffix(".html")
     cmd = [
@@ -292,7 +304,7 @@ def run_weasyprint(
         )
         return None
     try:
-        HTML(filename=str(html_tmp)).write_pdf(str(out_pdf))
+        HTML(filename=str(html_tmp), url_fetcher=_safe_fetcher).write_pdf(str(out_pdf))
     except Exception as exc:
         log.warning("livre.weasyprint_pdf_failed", extra={"error": str(exc)})
         return None

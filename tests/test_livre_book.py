@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -237,6 +238,63 @@ def test_run_pandoc_returns_none_on_failure(tmp_path: Path) -> None:
     src.write_text("# X", encoding="utf-8")
     epub = run_pandoc(src, tmp_path / "livre.epub", "T", pandoc=fake)
     assert epub is None
+
+
+def test_run_weasyprint_blocks_non_data_urls(tmp_path: Path) -> None:
+    """SSRF/LFI : weasyprint ne doit jamais fetcher file://, http(s)://, etc.
+    Seuls les `data:` URIs sont autorisés. On installe un faux module
+    `weasyprint` pour éviter la dépendance système."""
+    import subprocess
+    import sys
+    import types
+
+    from guetteur.export.livre_output import run_weasyprint
+
+    captured: list[str] = []
+
+    class _HTML:
+        def __init__(self, *, filename: str, url_fetcher: Any) -> None:
+            self._url_fetcher = url_fetcher
+            self._filename = filename
+
+        def write_pdf(self, out: str) -> None:
+            # Simule un fetch que weasyprint ferait pour un <img> dans le HTML.
+            for url in (
+                "file:///etc/passwd",
+                "http://169.254.169.254/latest/meta-data/",
+                "data:text/plain;base64,SGVsbG8=",
+            ):
+                res = self._url_fetcher(url)
+                captured.append(url)
+                # Les non-data doivent revenir vides (bloqués).
+                if not url.startswith("data:"):
+                    assert res["string"] == b"", f"url non bloquée : {url}"
+            Path(out).write_bytes(b"PDF")
+
+    def _default_fetcher(url: str) -> dict[str, Any]:
+        return {"string": b"ok", "mime_type": "text/plain"}
+
+    fake_mod = types.ModuleType("weasyprint")
+    fake_mod.HTML = _HTML  # type: ignore[attr-defined]
+    fake_mod.default_url_fetcher = _default_fetcher  # type: ignore[attr-defined]
+    sys.modules["weasyprint"] = fake_mod
+    try:
+        src = tmp_path / "livre.md"
+        src.write_text("# X", encoding="utf-8")
+
+        def fake_pandoc(cmd: list[str]) -> subprocess.CompletedProcess[str]:
+            Path(cmd[cmd.index("-o") + 1]).write_text(
+                "<html><body><img src='file:///etc/passwd'></body></html>",
+                encoding="utf-8",
+            )
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        pdf = run_weasyprint(src, tmp_path / "livre.pdf", "T", pandoc=fake_pandoc)
+        assert pdf is not None and pdf.exists()
+        assert "file:///etc/passwd" in captured
+        assert "http://169.254.169.254/latest/meta-data/" in captured
+    finally:
+        sys.modules.pop("weasyprint", None)
 
 
 def test_run_weasyprint_skips_when_not_installed(tmp_path: Path) -> None:
