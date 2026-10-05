@@ -375,6 +375,114 @@ def check_notebooklm(config: Config, store: Store | None = None) -> list[Check]:
     return checks
 
 
+def check_x_source(config: Config) -> list[Check]:
+    """Lot 8b : vérifie la configuration twitter-cli et le compte connecté.
+
+    - version du paquet installée == `x_source.pinned_version` ;
+    - variables d'env TWITTER_AUTH_TOKEN + TWITTER_CT0 présentes ;
+    - variables d'env interdites (TWITTER_BROWSER / TWITTER_CHROME_PROFILE)
+      ABSENTES — refus de démarrer si une seule est posée ;
+    - HOME dédié existe en 0700 ;
+    - `twitter whoami --json` renvoie exactement `account`.
+    """
+    if not config.x_source.enabled:
+        return [Check("x_source : collecte", True, "désactivé (x_source.enabled = false)")]
+    checks: list[Check] = []
+
+    expected = config.x_source.pinned_version
+    try:
+        from importlib.metadata import PackageNotFoundError, version
+
+        try:
+            got = version("twitter-cli")
+            ok_v = got == expected
+            checks.append(
+                Check("x_source : version", ok_v, f"attendu {expected}, trouvé {got}")
+            )
+        except PackageNotFoundError:
+            checks.append(
+                Check(
+                    "x_source : version",
+                    False,
+                    f"twitter-cli absent : uv sync --no-dev --no-build --extra x "
+                    f"(attendu {expected})",
+                )
+            )
+    except ImportError:
+        checks.append(Check("x_source : version", False, "importlib.metadata indisponible"))
+
+    import os
+
+    from guetteur.sources.x_subprocess import FORBIDDEN_ENV_VARS, XSourceEnv, verify_env
+
+    bad = verify_env()
+    checks.append(
+        Check(
+            "x_source : variables interdites",
+            not bad,
+            "aucune" if not bad else f"présentes : {', '.join(bad)} — refuser de démarrer",
+        )
+    )
+    _ = FORBIDDEN_ENV_VARS  # garde l'import visible (traçabilité audit)
+
+    auth_token = os.environ.get("TWITTER_AUTH_TOKEN", "")
+    ct0 = os.environ.get("TWITTER_CT0", "")
+    checks.append(
+        Check(
+            "x_source : cookies",
+            bool(auth_token and ct0),
+            "TWITTER_AUTH_TOKEN et TWITTER_CT0 présents"
+            if auth_token and ct0
+            else "TWITTER_AUTH_TOKEN et/ou TWITTER_CT0 manquant dans .env",
+        )
+    )
+
+    home = config.x_source.home
+    try:
+        home.mkdir(parents=True, exist_ok=True)
+        mode = home.stat().st_mode & 0o777
+        ok_perms = mode == 0o700 and home.is_dir()
+        checks.append(
+            Check(
+                "x_source : HOME 0700",
+                ok_perms,
+                f"{home} mode={mode:04o}" if ok_perms else f"{home} mode={mode:04o} (attendu 0700)",
+            )
+        )
+    except OSError as exc:
+        checks.append(Check("x_source : HOME 0700", False, f"{home} : {exc}"))
+
+    # Si cookies manquants ou variables interdites : on ne tente pas whoami.
+    if not (auth_token and ct0) or bad:
+        checks.append(
+            Check("x_source : compte connecté", False, "cookies ou env à corriger avant whoami")
+        )
+        return checks
+
+    try:
+        xenv = XSourceEnv(
+            binary=config.x_source.twitter_cli_bin,
+            home=home,
+            venv_bin=None,
+            auth_token=auth_token,
+            ct0=ct0,
+        )
+        from guetteur.sources.x_retweets import whoami
+
+        got_handle = whoami(xenv)
+        expected_handle = config.x_source.account.lstrip("@")
+        ok_a = got_handle.lower() == expected_handle.lower()
+        detail = (
+            f"@{got_handle} = @{expected_handle}"
+            if ok_a
+            else f"@{got_handle} ≠ @{expected_handle} (attendu)"
+        )
+        checks.append(Check("x_source : compte connecté", ok_a, detail))
+    except Exception as exc:
+        checks.append(Check("x_source : compte connecté", False, f"{type(exc).__name__}: {exc}"))
+    return checks
+
+
 def run_checks(
     config: Config, which: Which = shutil.which, claude: ClaudeCodeSummarizer | None = None
 ) -> list[Check]:
@@ -388,6 +496,7 @@ def run_checks(
     checks += check_youtube_source(config)
     checks += check_vault(config)
     checks += check_notebooklm(config)
+    checks += check_x_source(config)
     return checks
 
 

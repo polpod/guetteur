@@ -401,6 +401,118 @@ def cmd_digest(config: Config, since_spec: str) -> int:
         store.close()
 
 
+def _build_xenv(config: Config) -> Any:
+    """Construit le XSourceEnv depuis la config + les cookies .env.
+    Vérifie les variables interdites et lève ConfigError si posées."""
+    import os
+
+    from guetteur.sources.x_subprocess import (
+        XSourceEnv,
+        default_venv_bin,
+        verify_env,
+    )
+
+    bad = verify_env()
+    if bad:
+        raise ConfigError(
+            f"Variables d'environnement interdites présentes : {', '.join(bad)}. "
+            "Retirez-les du .env (audit twitter-cli §9.3)."
+        )
+    auth_token = os.environ.get("TWITTER_AUTH_TOKEN", "").strip()
+    ct0 = os.environ.get("TWITTER_CT0", "").strip()
+    if not auth_token or not ct0:
+        raise ConfigError(
+            "TWITTER_AUTH_TOKEN et TWITTER_CT0 doivent être posés dans .env "
+            "(audit twitter-cli §9.3)."
+        )
+    return XSourceEnv(
+        binary=config.x_source.twitter_cli_bin,
+        home=config.x_source.home,
+        venv_bin=default_venv_bin(),
+        auth_token=auth_token,
+        ct0=ct0,
+    )
+
+
+def cmd_x_status(config: Config) -> int:
+    """`guetteur x status` : état de la source + intervalle courant + gel."""
+    from guetteur.sources.x_retweets import (
+        freeze_reason,
+        interval_minutes,
+        is_frozen,
+        last_cycle_at,
+    )
+
+    store = Store(config.db_path)
+    try:
+        if not config.x_source.enabled:
+            print("x_source désactivé (config.toml : x_source.enabled = false)")
+            return 0
+        for source in ("x_retweets", "x_bookmarks"):
+            if source == "x_bookmarks" and not config.x_source.bookmarks:
+                continue
+            frozen = is_frozen(store, source)
+            interval = interval_minutes(store, source, config.x_source.poll_minutes)
+            last = last_cycle_at(store, source)
+            last_s = last.isoformat(timespec="seconds") if last else "(jamais)"
+            print(f"source={source}")
+            print(f"  compte : @{config.x_source.account.lstrip('@')}")
+            print(f"  watch_handle : @{config.x_source.watch_handle.lstrip('@')}")
+            print(f"  dernier cycle : {last_s}")
+            print(f"  intervalle courant : {interval} min")
+            print(f"  gelée : {'oui' if frozen else 'non'}")
+            if frozen:
+                print(f"  raison : {freeze_reason(store, source)}")
+        return 0
+    finally:
+        store.close()
+
+
+def cmd_x_resume(config: Config) -> int:
+    """`guetteur x resume` : lève le gel manuel sur toutes les sources X."""
+    from guetteur.sources.x_retweets import unfreeze
+
+    store = Store(config.db_path)
+    try:
+        for source in ("x_retweets", "x_bookmarks"):
+            unfreeze(store, source)
+            print(f"[OK] {source} : gel levé")
+        return 0
+    finally:
+        store.close()
+
+
+def cmd_x_backfill(config: Config, limit: int) -> int:
+    """`guetteur x backfill --limit N` : lance une collecte X non-initial, qui
+    insérera jusqu'à N tweets réellement nouveaux (le marqueur `initialized`
+    reste à 1, donc les suivants seront traités comme nouveaux)."""
+    from guetteur.sources.x_retweets import collect, mark_initialized
+
+    store = Store(config.db_path)
+    try:
+        if not config.x_source.enabled:
+            print("x_source désactivé.")
+            return 2
+        xenv = _build_xenv(config)
+        mark_initialized(store, "x_retweets")
+        stats = collect(store, config.x_source, xenv, source="x_retweets")
+        print(
+            f"[x_retweets] fetched={stats.fetched} new={stats.new_items} "
+            f"frozen={stats.frozen} reason={stats.reason}"
+        )
+        if config.x_source.bookmarks:
+            mark_initialized(store, "x_bookmarks")
+            stats_b = collect(store, config.x_source, xenv, source="x_bookmarks")
+            print(
+                f"[x_bookmarks] fetched={stats_b.fetched} new={stats_b.new_items} "
+                f"frozen={stats_b.frozen} reason={stats_b.reason}"
+            )
+        _ = limit  # réservé pour une variante future
+        return 0
+    finally:
+        store.close()
+
+
 def _console_notifier() -> Any:
     """Petit notifier qui écrit un résumé sur stdout, utilisé par `guetteur lien`."""
 
@@ -1298,6 +1410,13 @@ def build_parser() -> argparse.ArgumentParser:
     dg.add_argument(
         "--since", default="7d", help='fenêtre : "7d", "24h", "2w" ou ISO date (défaut 7d)'
     )
+    # Lot 8b : commandes source X.
+    xs = sub.add_parser("x", help="Lot 8b : collecte retweets X via twitter-cli (durci)")
+    xs_sub = xs.add_subparsers(dest="x_verb", required=True)
+    xs_sub.add_parser("status", help="état de la source : cycle, intervalle, gel")
+    xs_sub.add_parser("resume", help="redémarre la source après un gel")
+    bf = xs_sub.add_parser("backfill", help="relance N tweets au-delà du premier lancement")
+    bf.add_argument("--limit", type=int, default=20, help="nb max de tweets réintroduits")
     return parser
 
 
@@ -1361,6 +1480,16 @@ def cli(argv: Sequence[str] | None = None) -> int:
                 return cmd_liens(config)
             case "digest":
                 return cmd_digest(config, args.since)
+            case "x":
+                match args.x_verb:
+                    case "status":
+                        return cmd_x_status(config)
+                    case "resume":
+                        return cmd_x_resume(config)
+                    case "backfill":
+                        return cmd_x_backfill(config, args.limit)
+                    case _:
+                        return 2
     except (ConfigError, SourceError) as exc:
         print(f"❌ {exc}", file=sys.stderr)
         return 2

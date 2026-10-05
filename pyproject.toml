@@ -35,6 +35,14 @@ notebooklm = [
 pdf = [
     "weasyprint>=63",
 ]
+# Source X (Lot 8b) : twitter-cli épinglé exactement 0.8.5 (voir
+# audit-twitter-cli/RAPPORT.md §9-11). Le wheel 0.8.5 a été audité ligne à
+# ligne et son sha256 est documenté dans l'audit ; `install-lxc.sh` installe
+# avec --no-build et vérifie le hash. Ne jamais ajouter d'extra à twitter-cli
+# (le dépôt expose quelques `[extras]` : aucun n'est nécessaire ici).
+x = [
+    "twitter-cli==0.8.5",
+]
 
 [build-system]
 requires = ["hatchling"]

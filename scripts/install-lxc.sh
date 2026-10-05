@@ -23,6 +23,7 @@ REPO_HTTPS="https://github.com/polpod/guetteur.git"
 REPO_URL="${REPO_URL:-}"
 WITH_WHISPER="${WITH_WHISPER:-0}"
 WITH_NOTEBOOKLM="${WITH_NOTEBOOKLM:-1}" # extra epinglé, audité (voir audit §8-9)
+WITH_X="${WITH_X:-1}"                   # extra twitter-cli (Lot 8b), audité §9-11
 WITH_VAULT="${WITH_VAULT:-1}"           # clone du vault Obsidian (deploy key GitHub)
 VAULT_REMOTE="${VAULT_REMOTE:-git@github.com:polpod/vault-veille.git}"
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -32,10 +33,15 @@ UNITS=(
     guetteur-health.timer
     guetteur-nlm-refresh.service
     guetteur-nlm-refresh.timer
+    guetteur-digest.service
+    guetteur-digest.timer
 )
 # Wheel notebooklm-py 0.8.3, sha256 audité (voir audit-notebooklm/RAPPORT.md §9).
 NLM_VERSION="0.8.3"
 NLM_HASH="sha256:7e3e02057b3acf354d3dbc337c08869d2a4954c9c324f3271e272236cfcc2bfc"
+# Wheel twitter-cli 0.8.5, sha256 audité (voir audit-twitter-cli/RAPPORT.md §9-11).
+X_CLI_VERSION="0.8.5"
+X_CLI_HASH="sha256:b2e77204eae7159e10e199e3bf5296a691469457929cdf90a070cc5172f39317"
 
 # uv est installé par le script officiel dans /usr/local/bin ; on n'utilise QUE le chemin
 # absolu, jamais `uv` via PATH (sudo -u réinitialise PATH, le service systemd aussi).
@@ -355,14 +361,46 @@ extra=(--extra notebooklm --extra pdf)
 if [[ "$WITH_WHISPER" == "1" ]] || whisper_wanted "$INSTALL_DIR/config.toml"; then
     extra+=(--extra whisper)
 fi
+# --extra x (Lot 8b) : twitter-cli==0.8.5 pour la source retweets X.
+# `--no-build` plus bas garantit qu'on prend le wheel pré-build audité, pas la sdist.
+if [[ "$WITH_X" == "1" ]]; then
+    extra+=(--extra x)
+fi
 # On passe le chemin absolu de uv dans le sub-shell : sudo -u réinitialise PATH,
 # et l'utilisateur guetteur n'a pas /usr/local/bin dans son login PATH par défaut.
 sudo -u "$SERVICE_USER" -H bash -c '
     cd "$1" && shift
     "'"$UV_BIN"'" python install 3.12
-    "'"$UV_BIN"'" sync --frozen --no-dev --python 3.12 "$@"
+    "'"$UV_BIN"'" sync --frozen --no-dev --no-build --python 3.12 "$@"
 ' _ "$INSTALL_DIR" "${extra[@]}"
 ok "environnement prêt ($INSTALL_DIR/.venv, extras : ${extra[*]//--extra /})"
+
+if [[ "$WITH_X" == "1" ]]; then
+    log "twitter-cli $X_CLI_VERSION (audit §9-11 : wheel épinglé par hash)"
+    # Vérifie que le lock contient bien le sha256 audité pour twitter-cli.
+    # Si quelqu'un relock après ajout d'un extra inattendu, la ligne a de bonnes
+    # chances de bouger — cette assertion attire l'attention.
+    if ! grep -q "$X_CLI_HASH" "$INSTALL_DIR/uv.lock"; then
+        die "uv.lock ne référence pas $X_CLI_HASH — relancez un audit avant d'installer."
+    fi
+    # Blocage DNS local du dépôt tiers de fallback des queryId (audit §9.5) :
+    # tant que la table codée en dur de twitter-cli suffit, cet hôte n'est pas
+    # nécessaire. Si une montée de version l'exige, retirer cette ligne.
+    marker="# GUETTEUR Lot 8b : blocage fallback queryId twitter-cli (audit §9.5)"
+    if ! grep -qF "$marker" /etc/hosts; then
+        {
+            echo ""
+            echo "$marker"
+            echo "127.0.0.1 raw.githubusercontent.com"
+        } >>/etc/hosts
+        ok "/etc/hosts : 127.0.0.1 raw.githubusercontent.com (bloqué)"
+    else
+        ok "/etc/hosts : marqueur déjà présent, pas de doublon"
+    fi
+    # HOME dédié pour twitter-cli (audit §9.4 et A2 Lot 8b).
+    install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0700 "$INSTALL_DIR/data/x"
+    ok "$INSTALL_DIR/data/x (0700, $SERVICE_USER)"
+fi
 
 if [[ "$WITH_NOTEBOOKLM" == "1" ]]; then
     log "notebooklm-py $NLM_VERSION (uv tool sous $SERVICE_USER, wheel épinglé par hash)"
@@ -426,12 +464,13 @@ if [[ -s "/home/$SERVICE_USER/.claude/.credentials.json" ]] \
     session_ready=1
 fi
 if ((env_ready && session_ready)); then
-    systemctl enable guetteur.service guetteur-health.timer >/dev/null
-    systemctl restart guetteur.service guetteur-health.timer
+    systemctl enable guetteur.service guetteur-health.timer guetteur-digest.timer >/dev/null
+    systemctl restart guetteur.service guetteur-health.timer guetteur-digest.timer
     ok "service activé et (re)démarré"
 else
     # Désactivé tant que .env et la session Claude ne sont pas en place.
-    systemctl disable guetteur.service guetteur-health.timer >/dev/null 2>&1 || true
+    systemctl disable guetteur.service guetteur-health.timer guetteur-digest.timer \
+        >/dev/null 2>&1 || true
     ok "unités installées, désactivées (.env : $env_ready, session claude : $session_ready)"
 fi
 # Le refresh NotebookLM ne démarre que quand un master_token.json ou un

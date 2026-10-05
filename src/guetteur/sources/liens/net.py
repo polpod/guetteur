@@ -76,7 +76,16 @@ def resolve_safe(host: str) -> list[str]:
     """Résout `host` et refuse si une seule IP tombe dans un bloc interdit.
     Pas de « cherry-pick » : si getaddrinfo rend A1 publique et A2 privée on
     refuse — c'est de l'anti-rebinding, un attaquant qui contrôle le DNS peut
-    renvoyer l'une puis l'autre."""
+    renvoyer l'une puis l'autre.
+
+    ponytail: TOCTOU résiduel entre ce check et la connexion httpx. httpx
+    utilise le même resolver (socket.getaddrinfo), donc l'attaque suppose
+    un cache DNS qui change entre deux appels sub-seconde — très étroit en
+    pratique. Pinning au niveau transport (socket.create_connection avec
+    IP vérifiée + Host header manuel) exigerait de court-circuiter la
+    résolution httpx et le SNI TLS. À escalader si l'attaquant maîtrise
+    notre resolver local.
+    """
     try:
         infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
     except OSError as exc:
@@ -143,39 +152,58 @@ def safe_fetch(
     try:
         for hop in range(MAX_REDIRECTS + 1):
             try:
-                resp = cli.request(method, current, headers=headers)
+                # Stream : on borne la taille MÊME si Content-Length ment ou
+                # est absent (chunked). On ferme la connexion dès dépassement.
+                with cli.stream(method, current, headers=headers) as resp:
+                    if resp.is_redirect:
+                        loc = resp.headers.get("location", "")
+                        if not loc:
+                            raise LinkFetchError(
+                                f"Redirection sans Location depuis {current}"
+                            )
+                        current = str(httpx.URL(current).join(loc))
+                        _validate_url(current)
+                        if hop >= MAX_REDIRECTS:
+                            raise LinkFetchError(
+                                f"Trop de redirections (>{MAX_REDIRECTS}) depuis {url}"
+                            )
+                        continue
+                    if resp.status_code >= 400:
+                        raise LinkFetchError(f"HTTP {resp.status_code} sur {current}")
+                    cl_raw = resp.headers.get("content-length")
+                    if cl_raw and cl_raw.isdigit() and int(cl_raw) > max_bytes:
+                        raise LinkFetchError(
+                            f"Content-Length {cl_raw} > plafond {max_bytes} sur {current}"
+                        )
+                    buf = bytearray()
+                    for chunk in resp.iter_bytes():
+                        buf.extend(chunk)
+                        if len(buf) > max_bytes:
+                            raise LinkFetchError(
+                                f"Réponse > plafond {max_bytes} octets sur {current}"
+                            )
+                    ct = (
+                        resp.headers.get("content-type", "")
+                        .split(";", 1)[0]
+                        .strip()
+                        .lower()
+                    )
+                    # ponytail: utf-8 par défaut avec errors='replace'. Le
+                    # vrai charset viendrait d'un parse du Content-Type ou
+                    # d'une détection chardet, pas prioritaire pour un
+                    # résumé Claude.
+                    text = buf.decode("utf-8", errors="replace")
+                    return FetchResult(
+                        url=current,
+                        status_code=resp.status_code,
+                        headers={
+                            str(k).lower(): str(v) for k, v in resp.headers.items()
+                        },
+                        text=text,
+                        content_type=ct,
+                    )
             except httpx.HTTPError as exc:
                 raise LinkFetchError(f"HTTP {method} {current} : {exc}") from exc
-            if resp.is_redirect:
-                loc = resp.headers.get("location", "")
-                if not loc:
-                    raise LinkFetchError(f"Redirection sans Location depuis {current}")
-                # Résolution relative + revalidation complète.
-                current = str(httpx.URL(current).join(loc))
-                _validate_url(current)
-                if hop >= MAX_REDIRECTS:
-                    raise LinkFetchError(f"Trop de redirections (>{MAX_REDIRECTS}) depuis {url}")
-                continue
-            if resp.status_code >= 400:
-                raise LinkFetchError(f"HTTP {resp.status_code} sur {current}")
-            # Taille : lire via .content lève RequestError si trop gros ; on vérifie
-            # Content-Length d'abord puis la taille réelle du body.
-            cl_raw = resp.headers.get("content-length")
-            if cl_raw and cl_raw.isdigit() and int(cl_raw) > max_bytes:
-                raise LinkFetchError(
-                    f"Content-Length {cl_raw} > plafond {max_bytes} sur {current}"
-                )
-            body = resp.content
-            if len(body) > max_bytes:
-                raise LinkFetchError(f"Réponse de {len(body)} octets > plafond {max_bytes}")
-            ct = resp.headers.get("content-type", "").split(";", 1)[0].strip().lower()
-            return FetchResult(
-                url=current,
-                status_code=resp.status_code,
-                headers={str(k).lower(): str(v) for k, v in resp.headers.items()},
-                text=resp.text,
-                content_type=ct,
-            )
         raise LinkFetchError(f"Trop de redirections (>{MAX_REDIRECTS}) depuis {url}")
     finally:
         if owns_client:

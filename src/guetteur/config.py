@@ -220,6 +220,48 @@ class Secrets:
         )
 
 
+def _default_x_source_home() -> Path:
+    """HOME dédié à twitter-cli, audit §9.4 : jamais `~`, jamais partagé."""
+    if Path("/opt/guetteur").is_dir():
+        return Path("/opt/guetteur/data/x")
+    return Path.home() / ".guetteur-x"
+
+
+@dataclass(frozen=True)
+class XSourceConfig:
+    """Lot 8b : collecte des retweets (et signets opt-in) via twitter-cli.
+
+    Toutes les conditions A1-A6 de l'audit twitter-cli sont câblées ici :
+    binaire épinglé par le `pyproject` extra `x` et le lock, HOME dédié,
+    compte connecté vérifié par `doctor`, cadence >= 5 min, aucune commande
+    d'écriture n'est exposée côté GUETTEUR.
+    """
+
+    enabled: bool = False
+    # Compte connecté via les cookies TWITTER_AUTH_TOKEN/TWITTER_CT0 (dédié,
+    # audit §9.7). `doctor` refuse de démarrer si `twitter whoami` ne renvoie
+    # pas exactement ce handle.
+    account: str = ""
+    # Compte dont on lit les retweets (public, aucun cookie de ce compte).
+    watch_handle: str = ""
+    # Intervalle courant minimum (A6 : jamais sous 5 min).
+    poll_minutes: int = 30
+    # Signets du compte connecté (A6 : opt-in, cookies du compte principal
+    # — risque assumé, documenté dans config.toml et dans l'audit §9.5).
+    bookmarks: bool = False
+    # Nombre de tweets à lire par cycle (passé à `--max`).
+    max_fetch: int = 50
+    # Binaire twitter-cli — doit être dans le venv de GUETTEUR. On accepte un
+    # chemin absolu ou un nom à résoudre via le PATH restreint.
+    twitter_cli_bin: str = "twitter"
+    # HOME dédié (0700). Jamais `~`.
+    home: Path = field(default_factory=_default_x_source_home)
+    # Version attendue de twitter-cli — vérifiée par `doctor`.
+    pinned_version: str = "0.8.5"
+    # Timeout par appel subprocess (A3).
+    timeout_s: float = 60.0
+
+
 @dataclass(frozen=True)
 class Config:
     playlists: tuple[PlaylistConfig, ...]
@@ -239,6 +281,7 @@ class Config:
     obsidian: ObsidianConfig = field(default_factory=ObsidianConfig)
     applicability: ApplicabilityConfig = field(default_factory=ApplicabilityConfig)
     livre: LivreConfig = field(default_factory=LivreConfig)
+    x_source: XSourceConfig = field(default_factory=XSourceConfig)
     secrets: Secrets = field(default_factory=Secrets)
 
     @property
@@ -455,9 +498,64 @@ _SECTIONS = frozenset(
         "obsidian",
         "applicability",
         "livre",
+        "x_source",
         "playlists",
     }
 )
+
+
+def _parse_x_source(raw: dict[str, Any]) -> XSourceConfig:
+    """Parse [x_source]. Refuse `poll_minutes` < 5 (audit §9.8), handle vide,
+    binaire sans caractères raisonnables. HOME doit être absolu."""
+    default = XSourceConfig()
+    enabled = bool(raw.get("enabled", default.enabled))
+    account = str(raw.get("account", "")).strip()
+    watch_handle = str(raw.get("watch_handle", "")).strip()
+    poll_minutes_raw = raw.get("poll_minutes", default.poll_minutes)
+    if (
+        isinstance(poll_minutes_raw, bool)
+        or not isinstance(poll_minutes_raw, int | float)
+        or poll_minutes_raw < 5
+    ):
+        raise ConfigError(
+            f"x_source.poll_minutes doit être >= 5 (reçu : {poll_minutes_raw!r})"
+        )
+    bookmarks = bool(raw.get("bookmarks", default.bookmarks))
+    max_fetch = _positive_int(raw.get("max_fetch", default.max_fetch), "x_source.max_fetch")
+    binary = str(raw.get("twitter_cli_bin", default.twitter_cli_bin)).strip()
+    if not binary:
+        raise ConfigError("x_source.twitter_cli_bin ne peut pas être vide")
+    home_raw = raw.get("home")
+    home = Path(str(home_raw)) if home_raw else default.home
+    if not home.is_absolute():
+        raise ConfigError(f"x_source.home doit être un chemin absolu (reçu : {home!r})")
+    pinned_version = str(raw.get("pinned_version", default.pinned_version)).strip()
+    timeout_s = raw.get("timeout_s", default.timeout_s)
+    if (
+        isinstance(timeout_s, bool)
+        or not isinstance(timeout_s, int | float)
+        or timeout_s <= 0
+    ):
+        raise ConfigError(f"x_source.timeout_s doit être > 0 (reçu : {timeout_s!r})")
+
+    if enabled:
+        if not account:
+            raise ConfigError("x_source.enabled = true exige x_source.account non vide")
+        if not watch_handle:
+            raise ConfigError("x_source.enabled = true exige x_source.watch_handle non vide")
+
+    return XSourceConfig(
+        enabled=enabled,
+        account=account,
+        watch_handle=watch_handle,
+        poll_minutes=int(poll_minutes_raw),
+        bookmarks=bookmarks,
+        max_fetch=max_fetch,
+        twitter_cli_bin=binary,
+        home=home,
+        pinned_version=pinned_version,
+        timeout_s=float(timeout_s),
+    )
 
 
 def _parse_livre(raw: dict[str, Any]) -> LivreConfig:
@@ -586,6 +684,7 @@ def parse_config(data: dict[str, Any], secrets: Secrets | None = None) -> Config
         obsidian=_parse_obsidian(data.get("obsidian", {})),
         applicability=_parse_applicability(data.get("applicability", {})),
         livre=_parse_livre(data.get("livre", {})),
+        x_source=_parse_x_source(data.get("x_source", {})),
         secrets=effective_secrets,
     )
 

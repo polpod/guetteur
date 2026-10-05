@@ -44,6 +44,8 @@ def test_all_ok(tmp_path: Path) -> None:
         "youtube : source",
         # Archivage désactivé par défaut : une seule ligne récapitulative.
         "notebooklm : archivage",
+        # Lot 8b : source X désactivée par défaut, une seule ligne.
+        "x_source : collecte",
     ]
     rows = render_table(checks).splitlines()[2:]
     assert len(rows) == len(checks)

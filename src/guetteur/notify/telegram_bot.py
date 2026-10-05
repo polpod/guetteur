@@ -891,7 +891,42 @@ class TelegramBot:
         if cmd == "/digest":
             self._cmd_digest(args)
             return
+        if cmd == "/x":
+            self._cmd_x()
+            return
         self._send_plain(f"Commande inconnue : {cmd}. /help pour la liste.")
+
+    def _cmd_x(self) -> None:
+        """`/x` : état de la source X (Lot 8b). Lecture seule."""
+        if not self._config.x_source.enabled:
+            self._send_plain("Source X désactivée (x_source.enabled = false).")
+            return
+        from guetteur.sources.x_retweets import (
+            freeze_reason,
+            interval_minutes,
+            is_frozen,
+            last_cycle_at,
+        )
+
+        xs = self._config.x_source
+        lines = [
+            f"Source X : @{xs.account.lstrip('@')}",
+            f"watch_handle : @{xs.watch_handle.lstrip('@')}",
+        ]
+        for source in ("x_retweets", "x_bookmarks"):
+            if source == "x_bookmarks" and not xs.bookmarks:
+                continue
+            frozen = is_frozen(self._store, source)
+            interval = interval_minutes(self._store, source, xs.poll_minutes)
+            last = last_cycle_at(self._store, source)
+            last_s = last.isoformat(timespec="seconds") if last else "(jamais)"
+            lines.append("")
+            lines.append(f"[{source}]")
+            lines.append(f"dernier cycle : {last_s}")
+            lines.append(f"intervalle : {interval} min")
+            reason = freeze_reason(self._store, source) if frozen else ""
+            lines.append(f"gelée : {'oui — ' + reason if frozen else 'non'}")
+        self._send_plain("\n".join(lines))
 
     def _cmd_lien(self, args: list[str]) -> None:
         """`/lien <URL>` : traite explicitement une URL comme un lien à résumer."""
@@ -907,7 +942,14 @@ class TelegramBot:
         self._process_shared_urls(urls, source="telegram")
 
     def _cmd_liens(self) -> None:
-        """`/liens` : 10 derniers items LIEN envoyés."""
+        """`/liens` : 10 derniers items LIEN envoyés.
+
+        Titre et URL échappés en MarkdownV2 : un tweet peut contenir n'importe
+        quel caractère réservé (`*`, `_`, `[`, `(`, `\\`…). Dans l'URL d'un
+        lien `[texte](url)`, seuls `)` et `\\` doivent être échappés (voir
+        summarize/format.py)."""
+        from guetteur.summarize.format import escape_md_v2
+
         items = [i for i in self._store.list_items(limit=20) if i.really_sent][:10]
         if not items:
             self._send_plain("Aucun lien envoyé pour le moment.")
@@ -920,8 +962,10 @@ class TelegramBot:
                 "github": "🐙",
                 "youtube_oneshot": "🎞️",
             }.get(item.kind, "🔗")
-            title = (item.title or item.url)[:70]
-            lines.append(f"{label} [{title}]({item.url})")
+            raw_title = (item.title or item.url)[:70]
+            title = escape_md_v2(raw_title)
+            url = item.url.replace("\\", "\\\\").replace(")", "\\)")
+            lines.append(f"{label} [{title}]({url})")
         self._api.send_message(
             self._chat_id,
             "\n".join(lines),
@@ -1201,6 +1245,7 @@ class TelegramBot:
             "/lien <URL> — analyse et résume un lien (tweet, article, repo, vidéo)\n"
             "/liens — 10 derniers liens envoyés\n"
             "/digest [7d|24h|…] — digest hebdomadaire des liens et vidéos gardés\n"
+            "/x — état de la source X (Lot 8b : retweets via twitter-cli)\n"
             "/help — cette aide\n\n"
             "Réponds à n'importe quel message de résumé pour poser une question sur la vidéo, "
             "ou utilise le bouton « Question »."
